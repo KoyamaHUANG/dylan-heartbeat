@@ -127,7 +127,7 @@ async function sendPushNotification({ title, body }) {
     if (!response.ok) {
       return { ok: false, providerLabel: "ntfy", reason: responseText || `HTTP ${response.status}` };
     }
-    return { ok: true, providerLabel: "ntfy" };
+    return { ok: true, provider: "ntfy", providerLabel: "ntfy" };
   }
 
   if (provider !== "bark") {
@@ -162,7 +162,7 @@ async function sendPushNotification({ title, body }) {
   if (!response.ok || (result.code && result.code !== 200)) {
     return { ok: false, providerLabel: "Bark", reason: result.message || `HTTP ${response.status}` };
   }
-  return { ok: true, providerLabel: "Bark" };
+  return { ok: true, provider: "bark", providerLabel: "Bark" };
 }
 
 function isDayTime(date = new Date()) {
@@ -508,6 +508,7 @@ ${historyText}`
   const aiText = diaryResult.remainingText;
 
   let eventContent;
+  let proactivePayload;
 
   if (!aiText) {
     console.log("\nAI 未返回推送内容，本次不发送推送\n");
@@ -565,15 +566,23 @@ ${historyText}`
         eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：${pushResult.providerLabel} 推送失败：${pushResult.reason}）`;
       } else {
         eventContent = `（${getLocalTimeString()} 刚刚给用户发了${pushResult.providerLabel}推送：${pushDisplayName}｜${safeBody}）`;
+        proactivePayload = {
+          title: pushDisplayName,
+          body: safeBody,
+          provider: pushResult.provider,
+          sent_at: new Date().toISOString()
+        };
       }
     }
   }
 
   try {
+    const eventPayload = { content: eventContent };
+    if (proactivePayload) eventPayload.proactive = proactivePayload;
     const eventResponse = await fetch(GATEWAY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: eventContent })
+      body: JSON.stringify(eventPayload)
     });
     if (!eventResponse.ok) {
       throw new Error(`Gateway 返回 HTTP ${eventResponse.status}`);

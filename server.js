@@ -13,6 +13,16 @@ const {
 const { isSpecialEventContent } = require("./special_events");
 const { decideRequestAccess } = require("./network_access");
 const {
+  appendProactiveEvent,
+  listProactiveEvents,
+  validateProactiveEventInput
+} = require("./proactive_events");
+const {
+  loadKelivoSyncContext,
+  parseKelivoSyncHeaders,
+  saveKelivoSyncContext
+} = require("./kelivo_sync_context");
+const {
   formatDateTimeInTimeZone,
   resolveTimeZone
 } = require("./time_utils");
@@ -71,6 +81,58 @@ function configuredModelName() {
   // 批注 2026-07-15：/v1/models 要暴露部署者实际配置的模型名；
   // 不能继续硬编码示例模型，否则 Kelivo 模型选择会和真实上游不一致。
   return String(process.env.MODEL_NAME || "gateway-model").trim() || "gateway-model";
+}
+
+function defaultProactiveTitle() {
+  return String(process.env.PUSH_DISPLAY_NAME || "阿言").trim() || "阿言";
+}
+
+function isInputValidationError(error) {
+  return error?.code === "PROACTIVE_EVENT_VALIDATION" || error?.code === "KELIVO_SYNC_CONTEXT_VALIDATION";
+}
+
+function normalizeWakeProactivePayload(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("invalid proactive payload");
+  }
+  const sentAt = new Date(String(value.sent_at || ""));
+  if (Number.isNaN(sentAt.getTime())) throw new Error("invalid proactive sent_at");
+  const normalized = validateProactiveEventInput({
+    conversation_id: "wake-proactive-validation",
+    title: value.title,
+    body: value.body,
+    source: "wake",
+    push_provider: value.provider
+  });
+  return {
+    title: normalized.title,
+    body: normalized.body,
+    provider: normalized.push_provider,
+    sent_at: sentAt.toISOString()
+  };
+}
+
+function updateKelivoSyncContextFromChat(binding, messages) {
+  if (!binding?.provided || !kelivoEndsWithRealUser(messages)) return;
+  const latestUserMessage = findLatestRealUserMessage(messages);
+  if (!latestUserMessage) return;
+  try {
+    saveKelivoSyncContext({
+      conversation_id: binding.conversation_id,
+      assistant_id: binding.assistant_id,
+      latest_user_fingerprint: makeFingerprint(latestUserMessage)
+    });
+    console.log(JSON.stringify({
+      event: "kelivo_sync_context_updated",
+      conversation_bound: true,
+      assistant_bound: Boolean(binding.assistant_id)
+    }));
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: "kelivo_sync_context_save_failed",
+      error_category: error?.code || "storage_error"
+    }));
+  }
 }
 
 // ========================
@@ -461,6 +523,8 @@ const PREFERRED_ENV_ORDER = [
   "BARK_KEY",
   "CUSTOM_ICON_URL",
   "PUSH_DISPLAY_NAME",
+  "PROACTIVE_SYNC_TEST_ENABLED",
+  "PROACTIVE_EVENT_MAX_COUNT",
   "ALLOW_PUBLIC_API",
   "PUSH_PROVIDER",
   "NTFY_SERVER_URL",
@@ -588,6 +652,51 @@ app.get("/v1/models", async (req, reply) => {
 });
 
 // ========================
+// Kelivo proactive event inbox
+// ========================
+app.get("/v1/proactive-events", async (req, reply) => {
+  try {
+    const result = listProactiveEvents(req.query || {});
+    reply.send({ object: "proactive_event_list", ...result });
+  } catch (error) {
+    if (isInputValidationError(error)) {
+      return reply.code(400).send({ error: "Invalid proactive events query" });
+    }
+    console.warn(JSON.stringify({ event: "proactive_event_list_failed", error_category: error?.code || "storage_error" }));
+    reply.code(500).send({ error: "Proactive event store unavailable" });
+  }
+});
+
+app.post("/v1/proactive-events/test", async (req, reply) => {
+  if (!readBooleanEnv("PROACTIVE_SYNC_TEST_ENABLED", false)) {
+    return reply.code(404).send({ error: "Not Found" });
+  }
+  try {
+    const payload = req.body || {};
+    const event = appendProactiveEvent({
+      conversation_id: payload.conversation_id,
+      assistant_id: payload.assistant_id,
+      title: payload.title == null || String(payload.title).trim() === "" ? defaultProactiveTitle() : payload.title,
+      body: payload.body,
+      source: "manual_test",
+      push_provider: "none"
+    });
+    console.log(JSON.stringify({
+      event: "proactive_event_created",
+      seq: event.seq,
+      source: event.source
+    }));
+    reply.code(201).send(event);
+  } catch (error) {
+    if (isInputValidationError(error)) {
+      return reply.code(400).send({ error: "Invalid proactive test event" });
+    }
+    console.warn(JSON.stringify({ event: "proactive_event_create_failed", error_category: error?.code || "storage_error" }));
+    reply.code(500).send({ error: "Proactive event store unavailable" });
+  }
+});
+
+// ========================
 // Chat Completions
 // ========================
 app.post("/v1/chat/completions", async (req, reply) => {
@@ -604,6 +713,12 @@ app.post("/v1/chat/completions", async (req, reply) => {
     }));
 
     const kelivoMessages = body.messages || [];
+    let kelivoSyncBinding;
+    try {
+      kelivoSyncBinding = parseKelivoSyncHeaders(req.headers);
+    } catch (error) {
+      return reply.code(400).send({ error: "Invalid Kelivo conversation headers" });
+    }
     const oldTimeline = loadTimeline();
 
     const tsDB = loadTimestampDB();
@@ -611,6 +726,9 @@ app.post("/v1/chat/completions", async (req, reply) => {
     // 仅为本次请求最后一条真实 user 消息补收件时间；历史消息和重复请求绝不刷新为当前时间。
     tsDBDirty = rememberLatestUserReceiveTime(kelivoMessages, tsDB, requestReceivedAt) || tsDBDirty;
     if (tsDBDirty) saveTimestampDB(tsDB);
+
+    // 缺失 Header 的旧 Kelivo 保持完全兼容；只有真实 user 回合才更新持久化绑定。
+    updateKelivoSyncContextFromChat(kelivoSyncBinding, kelivoMessages);
 
     const finalTimeline = buildTimeline(kelivoMessages, tsDB);
     saveTimeline(finalTimeline);
@@ -758,9 +876,48 @@ app.post("/v1/chat/completions", async (req, reply) => {
 // ========================
 app.post("/internal/wake-event", async (req, reply) => {
   try {
-    const { content } = req.body;
+    const { content, proactive } = req.body || {};
     if (!content) return reply.code(400).send({ error: "content is required" });
     appendSpecialEvent(content);
+
+    if (proactive) {
+      let normalizedProactive;
+      try {
+        normalizedProactive = normalizeWakeProactivePayload(proactive);
+      } catch (error) {
+        console.warn(JSON.stringify({ event: "proactive_sync_skipped", reason: "invalid_proactive_payload" }));
+      }
+
+      if (normalizedProactive) {
+        const context = loadKelivoSyncContext();
+        if (!context?.conversation_id) {
+          console.log(JSON.stringify({ event: "proactive_sync_skipped", reason: "missing_conversation_binding" }));
+        } else {
+          try {
+            const event = appendProactiveEvent({
+              conversation_id: context.conversation_id,
+              assistant_id: context.assistant_id,
+              title: normalizedProactive.title,
+              body: normalizedProactive.body,
+              source: "wake",
+              push_provider: normalizedProactive.provider
+            });
+            console.log(JSON.stringify({
+              event: "proactive_event_created",
+              seq: event.seq,
+              source: event.source,
+              conversation_bound: true,
+              assistant_bound: Boolean(context.assistant_id)
+            }));
+          } catch (error) {
+            console.warn(JSON.stringify({
+              event: "proactive_event_create_failed",
+              error_category: error?.code || "storage_error"
+            }));
+          }
+        }
+      }
+    }
     reply.send({ success: true });
   } catch (err) {
     console.error(err);
