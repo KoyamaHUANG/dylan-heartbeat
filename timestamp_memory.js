@@ -100,6 +100,9 @@ function findLatestRealUserMessage(messages) {
 }
 
 module.exports = {
+  getTextFromContentPart,
+  isImageContentPart,
+  isFileContentPart,
   normalizeContentToText,
   parseTimestampLabel,
   makeFingerprint,

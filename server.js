@@ -17,6 +17,9 @@ const {
   resolveTimeZone
 } = require("./time_utils");
 const {
+  getTextFromContentPart,
+  isImageContentPart,
+  isFileContentPart,
   normalizeContentToText,
   parseTimestampLabel,
   makeFingerprint,
