@@ -51,6 +51,10 @@ function readBooleanEnv(key, fallback = false) {
   return ["1", "true", "yes", "on"].includes(raw);
 }
 
+function getPushDisplayName() {
+  return String(process.env.PUSH_DISPLAY_NAME || "阿言").trim() || "阿言";
+}
+
 function getDiaryDateString(date = new Date()) {
   const parts = getDatePartsInTimeZone(date, TIME_ZONE);
   return `${parts.year}-${parts.month}-${parts.day}`;
@@ -541,38 +545,26 @@ ${historyText}`
       .replace(/^标题[：:]\s*/gm, "")
       .replace(/^正文[：:]\s*/gm, "");
 
-    // 按行处理
+    // 模型的所有有效文本都保留为正文；通知标题固定使用可配置显示名称。
     const lines = barkText.split("\n").filter(line => line.trim() !== "");
 
-    let title, body;
     if (lines.length === 0) {
       console.log("\n推送内容清洗后为空，本次不发送推送\n");
       eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：推送内容为空）`;
-    } else if (lines.length === 1) {
-      title = "来自AI";
-      body = lines[0].trim();
-    } else if (lines.length === 2) {
-      title = lines[0].trim();
-      body = lines[1].trim();
-    } else {
-      // ≥3 行：第一行标题，剩余用空格拼接成正文
-      title = lines[0].trim();
-      body = lines.slice(1).map(l => l.trim()).join(" ");
     }
 
     if (!eventContent) {
       // 保护：截断过长正文，兼容 Bark 和 ntfy 的移动端展示。
+      const body = lines.map(line => line.trim()).join(" ");
       const safeBody = body.length > 500 ? body.substring(0, 497) + "..." : body;
-      // 若标题为空或以数字开头，加个前缀，可自行修改
-      let safeTitle = title || "来自伴侣";
-      if (/^\d/.test(safeTitle)) safeTitle = "来自伴侣｜" + safeTitle;
+      const pushDisplayName = getPushDisplayName();
 
-      const pushResult = await sendPushNotification({ title: safeTitle, body: safeBody });
+      const pushResult = await sendPushNotification({ title: pushDisplayName, body: safeBody });
       if (!pushResult.ok) {
         console.log(`\n${pushResult.providerLabel} 推送失败，本次不发送推送\n`);
         eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：${pushResult.providerLabel} 推送失败：${pushResult.reason}）`;
       } else {
-        eventContent = `（${getLocalTimeString()} 刚刚给用户发了${pushResult.providerLabel}推送：${safeTitle}｜${safeBody}）`;
+        eventContent = `（${getLocalTimeString()} 刚刚给用户发了${pushResult.providerLabel}推送：${pushDisplayName}｜${safeBody}）`;
       }
     }
   }

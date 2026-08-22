@@ -237,6 +237,7 @@ GATEWAY_API_KEY=请改成随机长密码
 MODEL_NAME=你的模型
 BARK_KEY=你的Bark设备Key
 CUSTOM_ICON_URL=https://你的图标URL（可选）
+PUSH_DISPLAY_NAME=阿言
 ALLOW_PUBLIC_API=false
 PUSH_PROVIDER=bark
 NTFY_SERVER_URL=https://ntfy.sh
@@ -420,6 +421,7 @@ WEATHER_UNITS=metric
 ```env
 PUSH_PROVIDER=bark
 BARK_KEY=你的Bark设备Key
+PUSH_DISPLAY_NAME=阿言
 ```
 
 如果你使用 Android，或想使用桌面/自建推送服务，可以切换到 [ntfy](https://ntfy.sh/)：

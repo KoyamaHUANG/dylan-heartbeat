@@ -7,6 +7,7 @@ const assert = require("node:assert/strict");
 const dataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "dylan-heartbeat-wake-"));
 const requestyUrl = "https://router.requesty.ai/v1/chat/completions";
 const gatewayBaseUrl = "http://gateway-test.local";
+const avatarUrl = "https://raw.githubusercontent.com/KoyamaHUANG/dylan-heartbeat/main/assets/ayan-avatar.jpg";
 process.env.DATA_DIR = dataDirectory;
 process.env.TARGET_API_URL = requestyUrl;
 process.env.TARGET_API_KEY = "wake-test-key";
@@ -14,6 +15,8 @@ process.env.MODEL_NAME = "anthropic/claude-sonnet-4-6";
 process.env.GATEWAY_BASE_URL = gatewayBaseUrl;
 process.env.BARK_KEY = "wake-test-bark-key";
 process.env.PUSH_PROVIDER = "bark";
+process.env.PUSH_DISPLAY_NAME = "阿言";
+process.env.CUSTOM_ICON_URL = avatarUrl;
 process.env.WEATHER_ENABLED = "false";
 process.env.DIARY_ENABLED = "true";
 process.env.DAY_WAKE_AFTER_MINUTES = "1";
@@ -87,6 +90,67 @@ test("wake-up 使用最小 Requesty Chat Completions payload 并发送 Bark", as
   }
   assert.equal(requests.filter(request => request.url === "https://api.day.app/push").length, 1);
   assert.equal(requests.filter(request => request.url === `${gatewayBaseUrl}/internal/wake-event`).length, 1);
+  const barkPayload = JSON.parse(requests.find(request => request.url === "https://api.day.app/push").options.body);
+  assert.equal(barkPayload.title, "阿言");
+  assert.equal(barkPayload.body, "想你了，在忙吗？");
+  assert.equal(barkPayload.icon, avatarUrl);
+});
+
+test("两行主动消息完整保留为正文，显示名称不取模型首行", async () => {
+  writeWakeState("两行主动消息");
+  const originalFetch = global.fetch;
+  const requests = [];
+  try {
+    global.fetch = async (url, options = {}) => {
+      requests.push({ url: String(url), options });
+      if (url === requestyUrl) {
+        return jsonResponse(200, {
+          choices: [{ message: { role: "assistant", content: "想你了\n早点休息呀" } }]
+        });
+      }
+      if (url === "https://api.day.app/push") return jsonResponse(200, { code: 200 });
+      if (url === `${gatewayBaseUrl}/internal/wake-event`) return jsonResponse(200, { success: true });
+      throw new Error(`unexpected URL: ${url}`);
+    };
+
+    await runWakeUp();
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  const barkPayload = JSON.parse(requests.find(request => request.url === "https://api.day.app/push").options.body);
+  assert.equal(barkPayload.title, "阿言");
+  assert.match(barkPayload.body, /想你了/);
+  assert.match(barkPayload.body, /早点休息呀/);
+});
+
+test("未设置 PUSH_DISPLAY_NAME 时默认使用阿言", async () => {
+  writeWakeState("默认显示名称");
+  const originalFetch = global.fetch;
+  const originalDisplayName = process.env.PUSH_DISPLAY_NAME;
+  const requests = [];
+  try {
+    delete process.env.PUSH_DISPLAY_NAME;
+    global.fetch = async (url, options = {}) => {
+      requests.push({ url: String(url), options });
+      if (url === requestyUrl) {
+        return jsonResponse(200, {
+          choices: [{ message: { role: "assistant", content: "默认名称测试" } }]
+        });
+      }
+      if (url === "https://api.day.app/push") return jsonResponse(200, { code: 200 });
+      if (url === `${gatewayBaseUrl}/internal/wake-event`) return jsonResponse(200, { success: true });
+      throw new Error(`unexpected URL: ${url}`);
+    };
+
+    await runWakeUp();
+  } finally {
+    process.env.PUSH_DISPLAY_NAME = originalDisplayName;
+    global.fetch = originalFetch;
+  }
+
+  const barkPayload = JSON.parse(requests.find(request => request.url === "https://api.day.app/push").options.body);
+  assert.equal(barkPayload.title, "阿言");
 });
 
 test("[NO_ACTION] 与 [DIARY] 保持静默、写入日记并记录事件", async () => {

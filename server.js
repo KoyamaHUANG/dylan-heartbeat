@@ -392,6 +392,7 @@ const PREFERRED_ENV_ORDER = [
   "MODEL_NAME",
   "BARK_KEY",
   "CUSTOM_ICON_URL",
+  "PUSH_DISPLAY_NAME",
   "ALLOW_PUBLIC_API",
   "PUSH_PROVIDER",
   "NTFY_SERVER_URL",
@@ -822,6 +823,7 @@ app.get("/admin", { preHandler: basicAuth }, async (req, reply) => {
   const currentUrl = readEnvValue("TARGET_API_URL");
   const currentModel = readEnvValue("MODEL_NAME");
   const currentIcon = readEnvValue("CUSTOM_ICON_URL");
+  const currentPushDisplayName = readEnvValueOrDefault("PUSH_DISPLAY_NAME", "阿言");
   const gatewayKeyStatus = readEnvValue("GATEWAY_API_KEY") ? "已配置" : "未配置";
   const wakeConfig = {
     dayWakeAfter: readEnvValueOrDefault("DAY_WAKE_AFTER_MINUTES", "60"),
@@ -1350,6 +1352,8 @@ const html = `<!DOCTYPE html>
         <input name="bark_key" id="f_bark" placeholder="留空不修改">
         <label>Bark Icon URL</label>
         <input name="custom_icon" id="f_icon" value="${escapeHtml(currentIcon)}" placeholder="可选">
+        <label>Push Display Name</label>
+        <input name="push_display_name" id="f_push_display_name" value="${escapeHtml(currentPushDisplayName)}" placeholder="阿言">
 
         <div class="section-title">Wake Settings</div>
         <div class="grid-2">
@@ -1456,6 +1460,7 @@ const html = `<!DOCTYPE html>
         model_name: document.getElementById("f_model").value.trim(),
         bark_key: document.getElementById("f_bark").value.trim(),
         custom_icon: document.getElementById("f_icon").value.trim(),
+        push_display_name: document.getElementById("f_push_display_name").value.trim(),
         day_wake_after: document.getElementById("f_day_wake_after").value.trim(),
         night_wake_after: document.getElementById("f_night_wake_after").value.trim(),
         day_check_interval: document.getElementById("f_day_check_interval").value.trim(),
@@ -1572,6 +1577,7 @@ app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
       model_name,
       bark_key,
       custom_icon,
+      push_display_name,
       day_wake_after,
       night_wake_after,
       day_check_interval,
@@ -1602,6 +1608,7 @@ app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
       MODEL_NAME: model_name,
       BARK_KEY: finalBarkKey,
       CUSTOM_ICON_URL: custom_icon || "",
+      PUSH_DISPLAY_NAME: String(push_display_name || "阿言").trim() || "阿言",
       DAY_WAKE_AFTER_MINUTES: normalizePositiveInteger(day_wake_after, "DAY_WAKE_AFTER_MINUTES", "60"),
       NIGHT_WAKE_AFTER_MINUTES: normalizePositiveInteger(night_wake_after, "NIGHT_WAKE_AFTER_MINUTES", "120"),
       DAY_CHECK_INTERVAL_MINUTES: normalizePositiveInteger(day_check_interval, "DAY_CHECK_INTERVAL_MINUTES", "10"),
