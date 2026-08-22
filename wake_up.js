@@ -8,13 +8,19 @@ const {
   formatDateTimeInTimeZone,
   getDatePartsInTimeZone,
   getHourInTimeZone,
-  resolveTimeZone,
-  zonedWallTimeToDate
+  resolveTimeZone
 } = require("./time_utils");
+const {
+  normalizeContentToText,
+  parseTimestampLabel,
+  getTimestampFromMemory,
+  findLatestRealUserMessage
+} = require("./timestamp_memory");
 
 // 批注 2026-08-10：与 Gateway 共用同一 DATA_DIR；未配置时仍落回项目目录，保护旧 VPS/本机部署。
 const DATA_DIR = ensureDataDir();
 const TIMELINE_PATH = runtimeFile("enhanced_messages.json");
+const TIMESTAMP_DB_PATH = runtimeFile("message_timestamps.json");
 const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 const GATEWAY_URL = `${GATEWAY_BASE_URL}/internal/wake-event`;
@@ -176,34 +182,6 @@ function getCheckIntervalMinutes(date = new Date()) {
     : readNumberEnv("NIGHT_CHECK_INTERVAL_MINUTES", 120, { min: 1 });
 }
 
-function normalizeContentToText(content) {
-  if (typeof content === "string") return content;
-  if (content == null) return "";
-
-  if (Array.isArray(content)) {
-    return content
-      .map(part => {
-        if (typeof part === "string") return part;
-        if (!part || typeof part !== "object") return "";
-        const type = typeof part.type === "string" ? part.type.toLowerCase() : "";
-        if (type === "text" || type === "input_text") return part.text || part.content || "";
-        if (part.image_url || type.includes("image")) return "[图片]";
-        if (part.file || type.includes("file")) return "[文件]";
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  if (content && typeof content === "object") {
-    const type = typeof content.type === "string" ? content.type.toLowerCase() : "";
-    if (content.image_url || type.includes("image")) return "[图片]";
-    if (content.file || type.includes("file")) return "[文件]";
-  }
-
-  return "[非文本内容]";
-}
-
 function summarizeWakeMessages(messages = []) {
   const list = Array.isArray(messages) ? messages : [];
   const roles = {};
@@ -333,23 +311,33 @@ function shouldWake(lastUserTime) {
 }
 
 function parseTimelineTimestamp(value) {
-  const text = String(value || "");
-  const match = text.match(/（?\s*(\d{4})([-/])(\d{1,2})\2(\d{1,2})(?:[ T]?)(\d{1,2})[:：](\d{2})/);
-  if (!match) return null;
-  const [, yyyy, , month, day, hour, minute] = match;
-  return zonedWallTimeToDate({ year: yyyy, month, day, hour, minute }, TIME_ZONE);
+  return parseTimestampLabel(value, TIME_ZONE);
 }
 
-function getLastUserTime(messages) {
-  const reversed = [...messages].reverse();
-  for (const msg of reversed) {
-    if (msg.role === "user") {
-      const content = normalizeContentToText(msg.content);
-      // 批注 2026-07-15：兼容 Kelivo 时间前缀 "YYYY-MM-DDHH:mm"；
-      // 旧的 "YYYY-MM-DD HH:mm" 仍然可用，避免无空格时间导致 wake-up 误判没有用户时间。
-      const parsed = parseTimelineTimestamp(content);
-      if (parsed) return parsed;
-    }
+function loadTimestampDB(filePath = TIMESTAMP_DB_PATH) {
+  if (!fs.existsSync(filePath)) return {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function getLastUserTime(messages, timestampDB = loadTimestampDB()) {
+  const latestUserMessage = findLatestRealUserMessage(messages);
+  if (!latestUserMessage) return null;
+
+  const parsed = parseTimelineTimestamp(normalizeContentToText(latestUserMessage.content));
+  if (parsed) {
+    console.log("最后用户时间来源：message content");
+    return parsed;
+  }
+
+  const remembered = getTimestampFromMemory(latestUserMessage, timestampDB);
+  if (remembered) {
+    console.log("最后用户时间来源：message timestamp memory");
+    return remembered;
   }
   return null;
 }
@@ -625,20 +613,31 @@ async function scheduleNextCheck() {
   setTimeout(scheduleNextCheck, getCheckIntervalMs());
 }
 
-// 潮水记得第一次没过礁石的时间。之后每一次涨落，都是同一片海在确认边界。
-// 启动第一次检查（延迟10秒）
-setTimeout(scheduleNextCheck, 10_000);
+function startWakeRuntime() {
+  // 潮水记得第一次没过礁石的时间。之后每一次涨落，都是同一片海在确认边界。
+  // 启动第一次检查（延迟10秒）
+  setTimeout(scheduleNextCheck, 10_000);
 
-console.log("\n==================================");
-console.log("Dylan Heartbeat Runtime 已启动（动态间隔）");
-console.log(JSON.stringify({
-  event: "wake_runtime_config_summary",
-  railway: Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID || process.env.RAILWAY_SERVICE_ID),
-  persistent_data: Boolean(process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH),
-  target_url_configured: Boolean(process.env.TARGET_API_URL),
-  target_key_configured: Boolean(process.env.TARGET_API_KEY),
-  model_configured: Boolean(process.env.MODEL_NAME),
-  push_provider_configured: Boolean(process.env.BARK_KEY || process.env.NTFY_TOPIC),
-  data_dir_ready: fs.existsSync(DATA_DIR)
-}));
-console.log("==================================\n");
+  console.log("\n==================================");
+  console.log("Dylan Heartbeat Runtime 已启动（动态间隔）");
+  console.log(JSON.stringify({
+    event: "wake_runtime_config_summary",
+    railway: Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID || process.env.RAILWAY_SERVICE_ID),
+    persistent_data: Boolean(process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH),
+    target_url_configured: Boolean(process.env.TARGET_API_URL),
+    target_key_configured: Boolean(process.env.TARGET_API_KEY),
+    model_configured: Boolean(process.env.MODEL_NAME),
+    push_provider_configured: Boolean(process.env.BARK_KEY || process.env.NTFY_TOPIC),
+    data_dir_ready: fs.existsSync(DATA_DIR)
+  }));
+  console.log("==================================\n");
+}
+
+if (require.main === module) startWakeRuntime();
+
+module.exports = {
+  getLastUserTime,
+  loadTimestampDB,
+  parseTimelineTimestamp,
+  startWakeRuntime
+};

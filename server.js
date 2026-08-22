@@ -14,9 +14,17 @@ const { isSpecialEventContent } = require("./special_events");
 const { decideRequestAccess } = require("./network_access");
 const {
   formatDateTimeInTimeZone,
-  resolveTimeZone,
-  zonedWallTimeToDate
+  resolveTimeZone
 } = require("./time_utils");
+const {
+  normalizeContentToText,
+  parseTimestampLabel,
+  makeFingerprint,
+  makeFingerprintStripped,
+  getTimestampFromMemory,
+  isRealUserMessageForTimeline,
+  findLatestRealUserMessage
+} = require("./timestamp_memory");
 
 const DEFAULT_BODY_LIMIT_MB = 50;
 
@@ -74,51 +82,6 @@ function shouldForwardMultimodalContent() {
 
 function isDataImageUrl(value) {
   return typeof value === "string" && /^data:image\//i.test(value);
-}
-
-function isImageContentPart(part) {
-  if (!part || typeof part !== "object") return false;
-  if (part.image_url) return true;
-  const type = typeof part.type === "string" ? part.type.toLowerCase() : "";
-  return type.includes("image");
-}
-
-function isFileContentPart(part) {
-  if (!part || typeof part !== "object") return false;
-  if (part.file) return true;
-  const type = typeof part.type === "string" ? part.type.toLowerCase() : "";
-  return type.includes("file");
-}
-
-function getTextFromContentPart(part) {
-  if (typeof part === "string") return part;
-  if (!part || typeof part !== "object") return "";
-  const type = typeof part.type === "string" ? part.type.toLowerCase() : "";
-  if (type === "text" || type === "input_text") return part.text || part.content || "";
-  if (typeof part.text === "string") return part.text;
-  return "";
-}
-
-function normalizeContentToText(content) {
-  if (typeof content === "string") return content;
-  if (content == null) return "";
-
-  if (Array.isArray(content)) {
-    const parts = content
-      .map(part => {
-        const text = getTextFromContentPart(part).trim();
-        if (text) return text;
-        if (isImageContentPart(part)) return "[图片]";
-        if (isFileContentPart(part)) return "[文件]";
-        return "";
-      })
-      .filter(Boolean);
-    return parts.join("\n");
-  }
-
-  if (isImageContentPart(content)) return "[图片]";
-  if (isFileContentPart(content)) return "[文件]";
-  return "[非文本内容]";
 }
 
 function normalizeMessageForTimeline(msg) {
@@ -231,60 +194,29 @@ function saveTimeline(messages) {
 // ========================
 // 提取时间戳（支持多种格式）
 // ========================
-function parseTimestampLabel(value) {
-  const text = String(value || "");
-  const match = text.match(/（?\s*(\d{4})([-/])(\d{1,2})\2(\d{1,2})(?:[ T]?)(\d{1,2})[:：](\d{2})/);
-  if (!match) return null;
-  const [, yyyy, , month, day, hour, minute] = match;
-  // 批注 2026-07-30：Kelivo 写进消息前缀的是用户配置时区的墙上时间；
-  // 公网/Railway 不能按服务器 UTC 解析，否则时间线和自动唤醒都会被推迟。
-  return zonedWallTimeToDate({ year: yyyy, month, day, hour, minute }, TIME_ZONE);
-}
-
-function stripLeadingTimestamp(content) {
-  // 批注 2026-07-15：兼容 Kelivo 有时把日期和时间贴在一起的前缀；
-  // 旧格式 "YYYY-MM-DD HH:mm" 继续保留，新格式 "YYYY-MM-DDHH:mm" 不再导致时间记忆/排序失效。
-  return String(content || "")
-    .replace(/^（?\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]?)\d{1,2}[:：]\d{2}[）\s]*/, "")
-    .trim();
-}
-
 function extractTimestamp(content) {
-  return parseTimestampLabel(content);
+  return parseTimestampLabel(content, TIME_ZONE);
 }
 
 // ========================
 // 时间戳记忆库
 // ========================
-function loadTimestampDB() {
-  if (!fs.existsSync(TIMESTAMP_DB_FILE)) return {};
-  try { return fs.readJsonSync(TIMESTAMP_DB_FILE); } catch { return {}; }
+function loadTimestampDB(filePath = TIMESTAMP_DB_FILE) {
+  if (!fs.existsSync(filePath)) return {};
+  try {
+    const parsed = fs.readJsonSync(filePath);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch { return {}; }
 }
 
 function saveTimestampDB(db) {
   writeJsonAtomicSync(TIMESTAMP_DB_FILE, db);
 }
 
-function makeFingerprint(msg) {
-  const raw = normalizeContentToText(msg.content);
-  const content = raw.trim().slice(0, 150);
-  return `${msg.role}::${content}`;
-}
-
-function makeFingerprintStripped(msg) {
-  const raw = normalizeContentToText(msg.content);
-  const content = stripLeadingTimestamp(raw).slice(0, 150);
-  return `${msg.role}::${content}`;
-}
-
 function extractTimestampWithMemory(msg, tsDB) {
   const fromContent = extractTimestamp(normalizeContentToText(msg.content));
   if (fromContent) return fromContent;
-  const fp = makeFingerprint(msg);
-  if (tsDB[fp]) return new Date(tsDB[fp]);
-  const fpStripped = makeFingerprintStripped(msg);
-  if (tsDB[fpStripped]) return new Date(tsDB[fpStripped]);
-  return null;
+  return getTimestampFromMemory(msg, tsDB);
 }
 
 // ========================
@@ -299,9 +231,40 @@ function isRealMessageForTimeline(msg) {
   if (msg.role === "system") return false;
   if (msg.tool_calls) return false;
   if (isSpecialEvent(msg)) return false;
-  const contentText = normalizeContentToText(msg.content);
-  if (msg.role === "user" && contentText.trim().startsWith("<system>")) return false;
-  return msg.role === "user" || msg.role === "assistant";
+  if (msg.role === "user") return isRealUserMessageForTimeline(msg);
+  return msg.role === "assistant";
+}
+
+function rememberContentTimestamps(messages, tsDB) {
+  let changed = false;
+  for (const msg of messages) {
+    if (msg.role === "system") continue;
+    if (msg.role === "tool") continue;
+    const ts = extractTimestamp(normalizeContentToText(msg.content));
+    if (!ts) continue;
+    const fp = makeFingerprint(msg);
+    const fpStripped = makeFingerprintStripped(msg);
+    if (!Object.prototype.hasOwnProperty.call(tsDB, fp)) { tsDB[fp] = ts.toISOString(); changed = true; }
+    if (!Object.prototype.hasOwnProperty.call(tsDB, fpStripped)) { tsDB[fpStripped] = ts.toISOString(); changed = true; }
+  }
+  return changed;
+}
+
+function rememberLatestUserReceiveTime(messages, tsDB, receivedAt = new Date()) {
+  const latestUserMessage = findLatestRealUserMessage(messages);
+  if (!latestUserMessage) return false;
+  if (extractTimestamp(normalizeContentToText(latestUserMessage.content))) return false;
+
+  const fp = makeFingerprint(latestUserMessage);
+  const fpStripped = makeFingerprintStripped(latestUserMessage);
+  if (Object.prototype.hasOwnProperty.call(tsDB, fp) || Object.prototype.hasOwnProperty.call(tsDB, fpStripped)) {
+    return false;
+  }
+
+  const receivedAtIso = new Date(receivedAt).toISOString();
+  tsDB[fp] = receivedAtIso;
+  tsDB[fpStripped] = receivedAtIso;
+  return true;
 }
 
 function isSystemRule(msg) {
@@ -557,6 +520,7 @@ app.get("/v1/models", async (req, reply) => {
 // ========================
 app.post("/v1/chat/completions", async (req, reply) => {
   try {
+    const requestReceivedAt = new Date();
     const body = req.body;
     // 批注 2026-07-15：公开部署时日志不能默认写入完整上下文；
     // 这里只保留请求摘要，避免 system prompt、记忆和聊天正文进入 pm2 日志。
@@ -571,17 +535,9 @@ app.post("/v1/chat/completions", async (req, reply) => {
     const oldTimeline = loadTimeline();
 
     const tsDB = loadTimestampDB();
-    let tsDBDirty = false;
-    for (const msg of kelivoMessages) {
-      if (msg.role === "system") continue;
-      if (msg.role === "tool") continue;
-      const ts = extractTimestamp(normalizeContentToText(msg.content));
-      if (!ts) continue;
-      const fp = makeFingerprint(msg);
-      const fpStripped = makeFingerprintStripped(msg);
-      if (!tsDB[fp]) { tsDB[fp] = ts.toISOString(); tsDBDirty = true; }
-      if (!tsDB[fpStripped]) { tsDB[fpStripped] = ts.toISOString(); tsDBDirty = true; }
-    }
+    let tsDBDirty = rememberContentTimestamps(kelivoMessages, tsDB);
+    // 仅为本次请求最后一条真实 user 消息补收件时间；历史消息和重复请求绝不刷新为当前时间。
+    tsDBDirty = rememberLatestUserReceiveTime(kelivoMessages, tsDB, requestReceivedAt) || tsDBDirty;
     if (tsDBDirty) saveTimestampDB(tsDB);
 
     const finalTimeline = buildTimeline(kelivoMessages, tsDB);
@@ -1749,24 +1705,39 @@ app.get("/admin/test-bark", { preHandler: basicAuth }, async (req, reply) => {
   reply.send({ success: true });
 });
 
-// ========================
-// 启动服务
-// ========================
-app.listen({ port: PORT, host: "0.0.0.0" }, (err, address) => {
-  if (err) {
-    console.error(err);
-    process.exit(1);
-  }
-  // 只打印是否配置，不输出 URL、Key、用户名、聊天内容或 Volume 名称。
-  console.log(JSON.stringify({
-    event: "runtime_config_summary",
-    railway: IS_RAILWAY_RUNTIME,
-    persistent_data: Boolean(process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH),
-    target_url_configured: Boolean(TARGET_API_URL),
-    target_key_configured: Boolean(process.env.TARGET_API_KEY),
-    model_configured: Boolean(process.env.MODEL_NAME),
-    gateway_key_configured: Boolean(readEnvValue("GATEWAY_API_KEY")),
-    data_dir_ready: fs.existsSync(DATA_DIR)
-  }));
-  console.log(`✅ Gateway 运行在 ${address}`);
-});
+function startServer() {
+  app.listen({ port: PORT, host: "0.0.0.0" }, (err, address) => {
+    if (err) {
+      console.error(err);
+      process.exit(1);
+    }
+    // 只打印是否配置，不输出 URL、Key、用户名、聊天内容或 Volume 名称。
+    console.log(JSON.stringify({
+      event: "runtime_config_summary",
+      railway: IS_RAILWAY_RUNTIME,
+      persistent_data: Boolean(process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH),
+      target_url_configured: Boolean(TARGET_API_URL),
+      target_key_configured: Boolean(process.env.TARGET_API_KEY),
+      model_configured: Boolean(process.env.MODEL_NAME),
+      gateway_key_configured: Boolean(readEnvValue("GATEWAY_API_KEY")),
+      data_dir_ready: fs.existsSync(DATA_DIR)
+    }));
+    console.log(`✅ Gateway 运行在 ${address}`);
+  });
+}
+
+if (require.main === module) startServer();
+
+module.exports = {
+  app,
+  extractTimestamp,
+  extractTimestampWithMemory,
+  findLatestRealUserMessage,
+  isRealMessageForTimeline,
+  loadTimestampDB,
+  makeFingerprint,
+  makeFingerprintStripped,
+  rememberContentTimestamps,
+  rememberLatestUserReceiveTime,
+  startServer
+};
