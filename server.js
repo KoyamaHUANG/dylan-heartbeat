@@ -277,6 +277,89 @@ function isSystemRule(msg) {
   return false;
 }
 
+function findLatestRealUserIndex(messages) {
+  if (!Array.isArray(messages)) return -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === "user" && !message.tool_calls && !isSystemRule(message)) return index;
+  }
+  return -1;
+}
+
+function kelivoEndsWithRealUser(messages) {
+  if (!Array.isArray(messages)) return false;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (!isRealMessageForTimeline(messages[index])) continue;
+    return messages[index].role === "user";
+  }
+  return false;
+}
+
+function sortSpecialEventsByTime(events, tsDB) {
+  return [...events].sort((a, b) => {
+    const timeA = extractTimestampWithMemory(a, tsDB);
+    const timeB = extractTimestampWithMemory(b, tsDB);
+    if (timeA && timeB) return timeA - timeB;
+    return 0;
+  });
+}
+
+function insertSpecialEventsByTime(messages, events, tsDB) {
+  const merged = [...messages];
+  for (const event of events) {
+    const eventTime = extractTimestampWithMemory(event, tsDB);
+    let insertionIndex = -1;
+
+    if (eventTime) {
+      insertionIndex = merged.findIndex(message => {
+        const messageTime = extractTimestampWithMemory(message, tsDB);
+        return Boolean(messageTime && messageTime >= eventTime);
+      });
+    }
+
+    // Legacy events may only contain a clock time and have no timestamp memory.
+    // Keep them in context, but never let an injected assistant event prefill a user turn.
+    if (insertionIndex < 0) {
+      const latestUserIndex = findLatestRealUserIndex(merged);
+      insertionIndex = latestUserIndex >= 0 ? latestUserIndex : merged.length;
+    }
+    merged.splice(insertionIndex, 0, event);
+  }
+  return merged;
+}
+
+function guardFinalUserMessageOrder(messages, kelivoMessages, injectedEventCount) {
+  if (!kelivoEndsWithRealUser(kelivoMessages) || messages.at(-1)?.role === "user") return messages;
+
+  const trailingSpecialEvents = [];
+  while (messages.length > 0 && isSpecialEvent(messages.at(-1))) {
+    trailingSpecialEvents.unshift(messages.pop());
+  }
+  if (trailingSpecialEvents.length === 0) return messages;
+
+  const latestUserIndex = findLatestRealUserIndex(messages);
+  if (latestUserIndex >= 0) messages.splice(latestUserIndex, 0, ...trailingSpecialEvents);
+  else messages.push(...trailingSpecialEvents);
+
+  console.warn(JSON.stringify({
+    event: "llm_message_order_guard",
+    roles: messages.map(message => message.role),
+    message_count: messages.length,
+    injected_event_count: injectedEventCount
+  }));
+  return messages;
+}
+
+const UPSTREAM_MESSAGE_FIELDS = ["role", "content", "name", "tool_calls", "tool_call_id"];
+
+function sanitizeMessageForUpstream(message) {
+  const sanitized = {};
+  for (const field of UPSTREAM_MESSAGE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(message, field)) sanitized[field] = message[field];
+  }
+  return sanitized;
+}
+
 // ========================
 // 构建 Timeline
 // ========================
@@ -292,28 +375,8 @@ function buildTimeline(kelivoMessages, tsDB) {
     .filter(isRealMessageForTimeline)
     .map(normalizeMessageForTimeline);
 
-  const oldSpecialEvents = oldTimeline.filter(isSpecialEvent).sort((a, b) => {
-    const timeA = extractTimestampWithMemory(a, tsDB);
-    const timeB = extractTimestampWithMemory(b, tsDB);
-    if (timeA && timeB) return timeA - timeB;
-    return 0;
-  });
-
-  const merged = [...newRealMessages];
-  for (const event of oldSpecialEvents) {
-    const eventTime = extractTimestampWithMemory(event, tsDB);
-    if (!eventTime) { merged.push(event); continue; }
-    let inserted = false;
-    for (let i = 0; i < merged.length; i++) {
-      const msgTime = extractTimestampWithMemory(merged[i], tsDB);
-      if (msgTime && msgTime >= eventTime) {
-        merged.splice(i, 0, event);
-        inserted = true;
-        break;
-      }
-    }
-    if (!inserted) merged.push(event);
-  }
+  const oldSpecialEvents = sortSpecialEventsByTime(oldTimeline.filter(isSpecialEvent), tsDB);
+  const merged = insertSpecialEventsByTime(newRealMessages, oldSpecialEvents, tsDB);
 
   const seen = new Set();
   const unique = merged.filter(msg => {
@@ -367,6 +430,11 @@ function appendSpecialEvent(content) {
     if (msg.position && msg.position > maxPos) maxPos = msg.position;
   }
   const newEvent = { role: "assistant", content, position: maxPos + 0.5 };
+  const eventTime = new Date().toISOString();
+  const tsDB = loadTimestampDB();
+  tsDB[makeFingerprint(newEvent)] = eventTime;
+  tsDB[makeFingerprintStripped(newEvent)] = eventTime;
+  saveTimestampDB(tsDB);
   timeline.push(newEvent);
   saveTimeline(timeline);
   // 批注 2026-07-15：特殊事件可能包含推送正文；日志只记录长度，避免公开部署时泄漏私密内容。
@@ -553,31 +621,10 @@ app.post("/v1/chat/completions", async (req, reply) => {
       .map(prepareMessageForLLM)
       .filter(Boolean);
 
-    const oldEvents = stripPosition(
-      oldTimeline.filter(isSpecialEvent).sort((a, b) => {
-        const timeA = extractTimestampWithMemory(a, tsDB);
-        const timeB = extractTimestampWithMemory(b, tsDB);
-        if (timeA && timeB) return timeA - timeB;
-        return 0;
-      })
-    );
+    const oldEvents = stripPosition(sortSpecialEventsByTime(oldTimeline.filter(isSpecialEvent), tsDB));
 
     console.log("本次注入的特殊事件数量:", oldEvents.length);
-
-    for (const event of oldEvents) {
-      const eventTime = extractTimestampWithMemory(event, tsDB);
-      if (!eventTime) { llmMessages.push(event); continue; }
-      let inserted = false;
-      for (let i = 0; i < llmMessages.length; i++) {
-        const msgTime = extractTimestampWithMemory(llmMessages[i], tsDB);
-        if (msgTime && msgTime >= eventTime) {
-          llmMessages.splice(i, 0, event);
-          inserted = true;
-          break;
-        }
-      }
-      if (!inserted) llmMessages.push(event);
-    }
+    llmMessages.splice(0, llmMessages.length, ...insertSpecialEventsByTime(llmMessages, oldEvents, tsDB));
 
 
 
@@ -652,6 +699,9 @@ app.post("/v1/chat/completions", async (req, reply) => {
       llmMessages.splice(idx, 1);
     }
 
+    guardFinalUserMessageOrder(llmMessages, kelivoMessages, oldEvents.length);
+    const upstreamMessages = llmMessages.map(sanitizeMessageForUpstream);
+
     if (!TARGET_API_URL || !process.env.TARGET_API_KEY) {
       return reply.code(500).send({ error: "TARGET_API_URL / TARGET_API_KEY 未配置" });
     }
@@ -665,7 +715,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
         "Content-Type": "application/json",
         Authorization: `Bearer ${process.env.TARGET_API_KEY}`
       },
-      body: JSON.stringify({ ...body, messages: llmMessages })
+      body: JSON.stringify({ ...body, messages: upstreamMessages })
     });
 
     const upstreamContentType = response.headers.get("content-type") || "";
