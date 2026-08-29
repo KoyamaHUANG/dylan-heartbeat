@@ -17,6 +17,10 @@ const {
   listProactiveEvents,
   validateProactiveEventInput
 } = require("./proactive_events");
+const { authorizeArchiveRequest } = require("./archive/archive_auth");
+const { SseAssistantCollector } = require("./archive/archive_stream");
+const { registerArchiveRoutes } = require("./archive/archive_routes");
+const { RawChatArchiveService, buildChatCaptureInput } = require("./archive/archive_sync");
 const {
   loadKelivoSyncContext,
   parseKelivoSyncHeaders,
@@ -38,6 +42,7 @@ const {
   isRealUserMessageForTimeline,
   findLatestRealUserMessage
 } = require("./timestamp_memory");
+const { parseChatCompletionResponse } = require("./upstream_response");
 
 const DEFAULT_BODY_LIMIT_MB = 50;
 
@@ -57,6 +62,7 @@ app.register(require("@fastify/formbody"));
 const PORT = Number(process.env.PORT) || 3000;
 const TARGET_API_URL = process.env.TARGET_API_URL;
 const TIME_ZONE = resolveTimeZone();
+const rawChatArchive = new RawChatArchiveService();
 const IS_RAILWAY_RUNTIME = Boolean(
   process.env.RAILWAY_ENVIRONMENT ||
   process.env.RAILWAY_PROJECT_ID ||
@@ -89,6 +95,13 @@ function defaultProactiveTitle() {
 
 function isInputValidationError(error) {
   return error?.code === "PROACTIVE_EVENT_VALIDATION" || error?.code === "KELIVO_SYNC_CONTEXT_VALIDATION";
+}
+
+function extractAssistantContentFromUpstream(responseText, contentType) {
+  const parsed = parseChatCompletionResponse(responseText, contentType);
+  const message = parsed?.choices?.[0]?.message;
+  if (!message || !Object.prototype.hasOwnProperty.call(message, "content")) return null;
+  return normalizeContentToText(message.content);
 }
 
 function normalizeWakeProactivePayload(value) {
@@ -525,6 +538,9 @@ const PREFERRED_ENV_ORDER = [
   "PUSH_DISPLAY_NAME",
   "PROACTIVE_SYNC_TEST_ENABLED",
   "PROACTIVE_EVENT_MAX_COUNT",
+  "ARCHIVE_ENABLED",
+  "ARCHIVE_DATABASE_URL",
+  "ARCHIVE_API_KEY",
   "ALLOW_PUBLIC_API",
   "PUSH_PROVIDER",
   "NTFY_SERVER_URL",
@@ -615,6 +631,15 @@ function readRestartCommand() {
 // ========================
 app.addHook("onRequest", (req, reply, done) => {
   const requestPath = req.url.split("?")[0];
+  if (requestPath.startsWith("/v1/archive/")) {
+    const archiveAccess = authorizeArchiveRequest(req.headers);
+    if (archiveAccess.allow) return done();
+    if (archiveAccess.status === 401) {
+      console.warn(JSON.stringify({ event: "archive_auth_rejected", auth_source: archiveAccess.source }));
+    }
+    reply.code(archiveAccess.status).send({ error: archiveAccess.error });
+    return;
+  }
   const ip = String(req.ip || req.connection.remoteAddress || "");
   const headerKey = String(req.headers["x-gateway-api-key"] || req.headers["x-api-key"] || "").trim();
   const access = decideRequestAccess({
@@ -649,6 +674,12 @@ app.get("/v1/models", async (req, reply) => {
     object: "list",
     data: [{ id: configuredModelName(), object: "model", created: 0, owned_by: "gateway" }]
   });
+});
+
+registerArchiveRoutes(app, { archiveService: rawChatArchive, timeZone: TIME_ZONE });
+
+app.addHook("onClose", async () => {
+  await rawChatArchive.close();
 });
 
 // ========================
@@ -726,6 +757,15 @@ app.post("/v1/chat/completions", async (req, reply) => {
     // 仅为本次请求最后一条真实 user 消息补收件时间；历史消息和重复请求绝不刷新为当前时间。
     tsDBDirty = rememberLatestUserReceiveTime(kelivoMessages, tsDB, requestReceivedAt) || tsDBDirty;
     if (tsDBDirty) saveTimestampDB(tsDB);
+
+    // Archive is an independent, fail-open observer. It never changes the rolling timeline or upstream payload.
+    const archiveCapture = rawChatArchive.captureChatRequest(buildChatCaptureInput({
+      binding: kelivoSyncBinding,
+      messages: kelivoMessages,
+      timestampDb: tsDB,
+      timeZone: TIME_ZONE,
+      observedAt: requestReceivedAt
+    }));
 
     // 缺失 Header 的旧 Kelivo 保持完全兼容；只有真实 user 回合才更新持久化绑定。
     updateKelivoSyncContextFromChat(kelivoSyncBinding, kelivoMessages);
@@ -842,6 +882,14 @@ app.post("/v1/chat/completions", async (req, reply) => {
     // 批注 2026-07-11：Kelivo 关闭 stream 时需要收到普通 JSON；只在请求或上游确认为 SSE 时才按流式直通。
     if (!shouldStreamResponse) {
       const responseText = await response.text();
+      if (response.ok) {
+        try {
+          const assistantContent = extractAssistantContentFromUpstream(responseText, upstreamContentType);
+          if (assistantContent != null) archiveCapture.archiveAssistant(assistantContent, { observedAt: new Date() });
+        } catch {
+          console.warn(JSON.stringify({ event: "archive_assistant_extract_failed", error_category: "upstream_response_unreadable" }));
+        }
+      }
       return reply
         .code(response.status)
         .header("Content-Type", upstreamContentType || "application/json")
@@ -859,12 +907,18 @@ app.post("/v1/chat/completions", async (req, reply) => {
     });
 
     const reader = response.body.getReader();
+    const archiveStreamCollector = new SseAssistantCollector();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       reply.raw.write(value);
+      archiveStreamCollector.feed(value);
     }
     reply.raw.end();
+    if (response.ok) {
+      const assistantContent = archiveStreamCollector.finish();
+      if (archiveStreamCollector.sawContent) archiveCapture.archiveAssistant(assistantContent, { observedAt: new Date() });
+    }
   } catch (err) {
     console.error(err);
     reply.code(500).send({ error: err.message });
@@ -909,6 +963,18 @@ app.post("/internal/wake-event", async (req, reply) => {
               conversation_bound: true,
               assistant_bound: Boolean(context.assistant_id)
             }));
+            rawChatArchive.captureProactive({
+              conversation_id: context.conversation_id,
+              assistant_id: context.assistant_id,
+              content: normalizedProactive.body,
+              message_time: normalizedProactive.sent_at,
+              observed_at: new Date(),
+              external_event_id: event.event_id,
+              metadata_json: {
+                title: normalizedProactive.title,
+                push_provider: normalizedProactive.provider
+              }
+            });
           } catch (error) {
             console.warn(JSON.stringify({
               event: "proactive_event_create_failed",
@@ -1937,6 +2003,8 @@ function startServer() {
       target_key_configured: Boolean(process.env.TARGET_API_KEY),
       model_configured: Boolean(process.env.MODEL_NAME),
       gateway_key_configured: Boolean(readEnvValue("GATEWAY_API_KEY")),
+      archive_enabled: readBooleanEnv("ARCHIVE_ENABLED", false),
+      archive_database_configured: Boolean(process.env.ARCHIVE_DATABASE_URL),
       data_dir_ready: fs.existsSync(DATA_DIR)
     }));
     console.log(`✅ Gateway 运行在 ${address}`);
@@ -1947,6 +2015,7 @@ if (require.main === module) startServer();
 
 module.exports = {
   app,
+  rawChatArchive,
   extractTimestamp,
   extractTimestampWithMemory,
   findLatestRealUserMessage,

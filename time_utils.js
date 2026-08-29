@@ -76,11 +76,38 @@ function zonedWallTimeToDate({ year, month, day, hour, minute }, timeZone = reso
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+function localDateRangeToUtc(dateText, timeZone = resolveTimeZone()) {
+  const match = String(dateText || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const calendarCheck = new Date(Date.UTC(year, month - 1, day));
+  if (
+    calendarCheck.getUTCFullYear() !== year ||
+    calendarCheck.getUTCMonth() !== month - 1 ||
+    calendarCheck.getUTCDate() !== day
+  ) return null;
+
+  const nextCalendar = new Date(Date.UTC(year, month - 1, day + 1));
+  const start = zonedWallTimeToDate({ year, month, day, hour: 0, minute: 0 }, timeZone);
+  const end = zonedWallTimeToDate({
+    year: nextCalendar.getUTCFullYear(),
+    month: nextCalendar.getUTCMonth() + 1,
+    day: nextCalendar.getUTCDate(),
+    hour: 0,
+    minute: 0
+  }, timeZone);
+  if (!start || !end || end <= start) return null;
+  return { start, end };
+}
+
 module.exports = {
   DEFAULT_TIME_ZONE,
   formatDateTimeInTimeZone,
   getDatePartsInTimeZone,
   getHourInTimeZone,
+  localDateRangeToUtc,
   resolveTimeZone,
   zonedWallTimeToDate
 };
