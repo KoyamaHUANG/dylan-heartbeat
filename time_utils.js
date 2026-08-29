@@ -1,3 +1,5 @@
+const { Temporal } = require("@js-temporal/polyfill");
+
 const DEFAULT_TIME_ZONE = "Asia/Shanghai";
 
 function resolveTimeZone(raw = process.env.TIME_ZONE, fallback = DEFAULT_TIME_ZONE) {
@@ -56,50 +58,56 @@ function getTimeZoneOffsetMs(date, timeZone) {
 }
 
 function zonedWallTimeToDate({ year, month, day, hour, minute }, timeZone = resolveTimeZone()) {
-  const utcGuess = Date.UTC(
-    Number(year),
-    Number(month) - 1,
-    Number(day),
-    Number(hour),
-    Number(minute),
-    0
-  );
-  let offset = getTimeZoneOffsetMs(new Date(utcGuess), timeZone);
-  let parsed = new Date(utcGuess - offset);
-
-  // 批注 2026-07-30：Kelivo 时间戳是用户所在时区的墙上时间；Railway 常用 UTC，
-  // 这里显式按 TIME_ZONE 转成真实 UTC Date，避免把北京时间误当 UTC 导致“用户来自未来”。
-  const adjustedOffset = getTimeZoneOffsetMs(parsed, timeZone);
-  if (adjustedOffset !== offset) {
-    parsed = new Date(utcGuess - adjustedOffset);
+  try {
+    // Wall-clock timestamps must identify one real instant.  Do not silently
+    // choose an offset for a skipped or repeated local time.
+    const zoned = Temporal.ZonedDateTime.from({
+      timeZone,
+      calendar: "iso8601",
+      year: Number(year),
+      month: Number(month),
+      day: Number(day),
+      hour: Number(hour),
+      minute: Number(minute),
+      second: 0,
+      millisecond: 0,
+      microsecond: 0,
+      nanosecond: 0
+    }, { disambiguation: "reject" });
+    return new Date(Number(zoned.epochMilliseconds));
+  } catch {
+    return null;
   }
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 function localDateRangeToUtc(dateText, timeZone = resolveTimeZone()) {
   const match = String(dateText || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!match) return null;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const calendarCheck = new Date(Date.UTC(year, month - 1, day));
-  if (
-    calendarCheck.getUTCFullYear() !== year ||
-    calendarCheck.getUTCMonth() !== month - 1 ||
-    calendarCheck.getUTCDate() !== day
-  ) return null;
-
-  const nextCalendar = new Date(Date.UTC(year, month - 1, day + 1));
-  const start = zonedWallTimeToDate({ year, month, day, hour: 0, minute: 0 }, timeZone);
-  const end = zonedWallTimeToDate({
-    year: nextCalendar.getUTCFullYear(),
-    month: nextCalendar.getUTCMonth() + 1,
-    day: nextCalendar.getUTCDate(),
-    hour: 0,
-    minute: 0
-  }, timeZone);
-  if (!start || !end || end <= start) return null;
-  return { start, end };
+  try {
+    const localDate = Temporal.PlainDate.from(dateText);
+    const nextLocalDate = localDate.add({ days: 1 });
+    // [start, nextStart) is derived from two independently resolved local
+    // midnights, so DST days can be 23, 24, or 25 hours. A skipped/repeated
+    // midnight is rejected instead of being mapped to a neighbouring date.
+    const start = zonedWallTimeToDate({
+      year: localDate.year,
+      month: localDate.month,
+      day: localDate.day,
+      hour: 0,
+      minute: 0
+    }, timeZone);
+    const end = zonedWallTimeToDate({
+      year: nextLocalDate.year,
+      month: nextLocalDate.month,
+      day: nextLocalDate.day,
+      hour: 0,
+      minute: 0
+    }, timeZone);
+    if (!start || !end || end <= start) return null;
+    return { start, end };
+  } catch {
+    return null;
+  }
 }
 
 module.exports = {

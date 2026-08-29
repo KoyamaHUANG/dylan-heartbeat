@@ -16,6 +16,13 @@ function parseArchiveLimit(value) {
   return limit;
 }
 
+function parseArchiveBoolean(value, field) {
+  if (value == null || value === "") return false;
+  if (value === true || value === "true") return true;
+  if (value === false || value === "false") return false;
+  throw queryError(`${field} must be true or false`);
+}
+
 function parseArchiveQuery(query = {}, { timeZone, archiveApiKey } = {}) {
   const conversation_id = typeof query.conversation_id === "string" ? query.conversation_id.trim() : "";
   if (!conversation_id || conversation_id.length > 128 || /[\u0000-\u001F\u007F]/.test(conversation_id)) {
@@ -25,10 +32,11 @@ function parseArchiveQuery(query = {}, { timeZone, archiveApiKey } = {}) {
   const dateRange = date ? localDateRangeToUtc(date, timeZone) : null;
   if (date && !dateRange) throw queryError("date must be a valid YYYY-MM-DD");
   const limit = parseArchiveLimit(query.limit);
+  const include_duplicates = parseArchiveBoolean(query.include_duplicates, "include_duplicates");
   const cursor = query.cursor == null || query.cursor === ""
     ? null
-    : parseArchiveCursor(String(query.cursor), archiveApiKey, { conversation_id, date });
-  return { conversation_id, date, dateRange, limit, cursor };
+    : parseArchiveCursor(String(query.cursor), archiveApiKey, { conversation_id, date, include_duplicates });
+  return { conversation_id, date, dateRange, limit, include_duplicates, cursor };
 }
 
 function archiveRouteError(reply, error) {
@@ -52,6 +60,7 @@ function registerArchiveRoutes(app, { archiveService, timeZone, archiveApiKey = 
         ? createArchiveCursor({
           conversation_id: query.conversation_id,
           date: query.date,
+          include_duplicates: query.include_duplicates,
           sequence: last.sequence,
           id: last.id
         }, archiveApiKey)
@@ -72,7 +81,10 @@ function registerArchiveRoutes(app, { archiveService, timeZone, archiveApiKey = 
           observed_at: message.observed_at,
           source: message.source,
           sequence: message.sequence,
+          canonical: message.canonical,
           confirmed: message.confirmed,
+          completion_status: message.completion_status,
+          delivery_status: message.delivery_status,
           reconcile_status: message.reconcile_status
         })),
         next_cursor
@@ -95,4 +107,4 @@ function registerArchiveRoutes(app, { archiveService, timeZone, archiveApiKey = 
   });
 }
 
-module.exports = { parseArchiveLimit, parseArchiveQuery, registerArchiveRoutes };
+module.exports = { parseArchiveBoolean, parseArchiveLimit, parseArchiveQuery, registerArchiveRoutes };

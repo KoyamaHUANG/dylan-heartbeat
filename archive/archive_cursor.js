@@ -36,7 +36,11 @@ function parseArchiveCursor(cursor, secret, expected = {}) {
   if (!payload || payload.v !== 1 || !Number.isSafeInteger(payload.sequence) || payload.sequence < 0 || !Number.isSafeInteger(payload.id) || payload.id < 0) {
     throw cursorError("cursor payload is invalid");
   }
-  if (payload.conversation_id !== expected.conversation_id || (payload.date || null) !== (expected.date || null)) {
+  if (
+    payload.conversation_id !== expected.conversation_id ||
+    (payload.date || null) !== (expected.date || null) ||
+    Boolean(payload.include_duplicates) !== Boolean(expected.include_duplicates)
+  ) {
     throw cursorError("cursor does not match query");
   }
   return payload;

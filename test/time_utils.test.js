@@ -19,3 +19,14 @@ test("formats wake-up time and day/night hour in the configured timezone", () =>
   assert.equal(formatDateTimeInTimeZone(date, "Asia/Shanghai"), "2026-07-30 10:15");
   assert.equal(getHourInTimeZone(date, "Asia/Shanghai"), 10);
 });
+
+test("rejects ambiguous and nonexistent IANA wall times instead of choosing an offset", () => {
+  assert.equal(
+    zonedWallTimeToDate({ year: 2026, month: 11, day: 1, hour: 1, minute: 30 }, "America/New_York"),
+    null
+  );
+  assert.equal(
+    zonedWallTimeToDate({ year: 2026, month: 3, day: 8, hour: 2, minute: 30 }, "America/New_York"),
+    null
+  );
+});

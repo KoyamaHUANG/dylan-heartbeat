@@ -1,15 +1,16 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { newDb } = require("pg-mem");
-const { ArchiveStore } = require("../archive/archive_store");
+const { ArchiveStore, resolveRollingOverlap } = require("../archive/archive_store");
 const {
   RawChatArchiveService,
   buildChatCaptureInput,
   stableStringify
 } = require("../archive/archive_sync");
-const { archiveContent, contentFingerprint } = require("../archive/archive_content");
+const { archiveContent, contentFingerprint, messageIdentity } = require("../archive/archive_content");
 const { authorizeArchiveRequest } = require("../archive/archive_auth");
 const { createArchiveCursor, parseArchiveCursor } = require("../archive/archive_cursor");
 const { SseAssistantCollector } = require("../archive/archive_stream");
@@ -25,7 +26,7 @@ function makeArchive({ now = () => new Date("2026-08-20T10:00:00.000Z") } = {}) 
   // rejects some otherwise-valid DDL constraint ASTs before execution.
   db.public.none(fs.readFileSync(path.join(__dirname, "..", "migrations", "001_initial.sql"), "utf8"));
   const { Pool } = db.adapters.createPg();
-  const store = new ArchiveStore({ pool: new Pool(), now, retryWindowMs: 10 * 60 * 1000 });
+  const store = new ArchiveStore({ pool: new Pool(), now });
   store.migrated = true;
   return { db, store, service: new RawChatArchiveService({ enabled: true, store, logger: silentLogger() }) };
 }
@@ -40,7 +41,8 @@ function captureInput(messages, options = {}) {
     messages,
     timestampDb: options.timestampDb || {},
     timeZone: options.timeZone || "Asia/Shanghai",
-    observedAt: options.observedAt || new Date("2026-08-20T10:00:00.000Z")
+    observedAt: options.observedAt || new Date("2026-08-20T10:00:00.000Z"),
+    clientRequestId: options.clientRequestId || null
   });
 }
 
@@ -92,8 +94,8 @@ test("empty user and assistant content are valid factual archive rows", async ()
   await service.close();
 });
 
-test("rolling contexts reconcile, repeated short text remains separate, and retry is deduped", async () => {
-  const { service } = makeArchive();
+test("rolling contexts reconcile and an unproven same-payload retry remains archived", async () => {
+  const { service, store } = makeArchive();
   const firstMessages = [
     { role: "user", content: "开场" },
     { role: "assistant", content: "好的" },
@@ -108,10 +110,12 @@ test("rolling contexts reconcile, repeated short text remains separate, and retr
   await retry.archiveAssistant("好的", { observedAt: new Date("2026-08-20T10:01:03.000Z") });
   await service.flush();
   const page = await listAll(service);
-  assert.equal(page.messages.length, 6);
-  assert.equal(page.messages.filter(row => row.role === "user" && row.content_text === "嗯").length, 2);
-  assert.equal(page.messages.filter(row => row.role === "assistant" && row.content_text === "好的").length, 3);
-  assert.deepEqual(page.messages.map(row => row.sequence), [1, 2, 3, 4, 5, 6]);
+  assert.equal(page.messages.length, 8);
+  assert.equal(page.messages.filter(row => row.role === "user" && row.content_text === "嗯").length, 3);
+  assert.equal(page.messages.filter(row => row.role === "assistant" && row.content_text === "好的").length, 4);
+  assert.deepEqual(page.messages.map(row => row.sequence), [1, 2, 3, 4, 5, 6, 7, 8]);
+  const conflicts = await store.pool.query("SELECT reason, status FROM archive_reconciliation_conflicts");
+  assert.deepEqual(conflicts.rows, [{ reason: "possible_transport_retry_unproven", status: "open" }]);
   await service.close();
 });
 
@@ -178,9 +182,9 @@ test("temporary archive database failure is contained and later recovery continu
   await service.close();
 });
 
-test("same rolling request from two devices is serialized into one archived turn", async () => {
+test("same client request identity from two devices is serialized into one archived turn", async () => {
   const { service } = makeArchive();
-  const input = captureInput([{ role: "user", content: "同一台账请求" }]);
+  const input = captureInput([{ role: "user", content: "同一台账请求" }], { clientRequestId: "stable-request-1" });
   const [first, second] = [service.captureChatRequest(input), service.captureChatRequest(input)];
   await Promise.all([first.archiveAssistant("同一回复"), second.archiveAssistant("同一回复")]);
   await service.flush();
@@ -205,7 +209,7 @@ test("date-filtered message and stats queries use UTC message times", async () =
 });
 
 test("multimodal archive removes image base64 while preserving text and URL metadata", () => {
-  const dataUrl = "data:image/png;base64," + "QUJD".repeat(1024);
+  const dataUrl = "data:image/png;base64," + "QUJD".repeat(512 * 1024);
   const archived = archiveContent([
     { type: "text", text: "中文 😊" },
     { type: "image_url", image_url: { url: dataUrl } },
@@ -214,6 +218,7 @@ test("multimodal archive removes image base64 while preserving text and URL meta
   const serialized = JSON.stringify(archived.content_json);
   assert.match(archived.content_text, /中文 😊/);
   assert.equal(serialized.includes(dataUrl), false);
+  assert.ok(serialized.length < dataUrl.length / 100);
   assert.match(serialized, /image_data_omitted/);
   assert.match(serialized, /https:\/\/example\.invalid\/image\.png/);
 });
@@ -235,6 +240,10 @@ test("configured time zone produces correct UTC date boundaries including DST", 
   const spring = localDateRangeToUtc("2026-03-08", "America/New_York");
   assert.equal(spring.start.toISOString(), "2026-03-08T05:00:00.000Z");
   assert.equal(spring.end.toISOString(), "2026-03-09T04:00:00.000Z");
+  const fall = localDateRangeToUtc("2026-11-01", "America/New_York");
+  assert.equal(fall.start.toISOString(), "2026-11-01T04:00:00.000Z");
+  assert.equal(fall.end.toISOString(), "2026-11-02T05:00:00.000Z");
+  assert.equal(localDateRangeToUtc("2011-12-30", "Pacific/Apia"), null);
   assert.equal(localDateRangeToUtc("2026-02-30", "Asia/Shanghai"), null);
 });
 
@@ -258,4 +267,185 @@ test("stable request canonicalization is insensitive to object field order", () 
     contentFingerprint("user", { b: 1, a: { z: 2, y: 3 } }),
     contentFingerprint("user", { a: { y: 3, z: 2 }, b: 1 })
   );
+});
+
+test("two real identical short user turns without a request ID are never silently dropped", async () => {
+  const { service, store } = makeArchive();
+  const first = service.captureChatRequest(captureInput([{ role: "user", content: "嗯" }]));
+  await first.archiveAssistant("怎么啦");
+  const second = service.captureChatRequest(captureInput([{ role: "user", content: "嗯" }], {
+    observedAt: new Date("2026-08-20T10:00:10.000Z")
+  }));
+  await second.archiveAssistant("我在");
+  await service.flush();
+  const page = await listAll(service);
+  assert.deepEqual(page.messages.map(row => row.content_text), ["嗯", "怎么啦", "嗯", "我在"]);
+  assert.deepEqual(page.messages.filter(row => row.role === "user").map(row => row.reconcile_status), ["direct", "possible_retry"]);
+  assert.equal((await store.pool.query("SELECT COUNT(*)::int AS count FROM archive_reconciliation_conflicts WHERE status = 'open'")).rows[0].count, 1);
+  await service.close();
+});
+
+test("deterministic client request ID is the only retry identity", async () => {
+  const { service } = makeArchive();
+  const input = captureInput([{ role: "user", content: "同一 HTTP 请求" }], { clientRequestId: "kelivo-request-42" });
+  const first = service.captureChatRequest(input);
+  const retry = service.captureChatRequest(input);
+  await Promise.all([first.archiveAssistant("第一次上游结果"), retry.archiveAssistant("重复生命周期结果")]);
+  await service.flush();
+  const page = await listAll(service);
+  assert.equal(page.messages.length, 2);
+  assert.equal(page.messages.filter(row => row.role === "user").length, 1);
+  assert.equal(page.messages.filter(row => row.role === "assistant").length, 1);
+  await service.close();
+});
+
+test("two concurrent assistant writes for one turn leave exactly one canonical assistant", async () => {
+  const { store, service } = makeArchive();
+  const turn = await store.captureIncomingTurn(captureInput([{ role: "user", content: "并发回复" }]));
+  const results = await Promise.all([
+    store.captureAssistantForTurn({ turn_id: turn.turn_id, content: "A", observed_at: "2026-08-20T10:00:01.000Z" }),
+    store.captureAssistantForTurn({ turn_id: turn.turn_id, content: "B", observed_at: "2026-08-20T10:00:02.000Z" })
+  ]);
+  assert.equal(results.filter(result => !result.deduped).length, 1);
+  assert.equal(results.filter(result => result.deduped).length, 1);
+  const allTurnMessages = await store.pool.query("SELECT archive_message_id, canonical, role FROM archive_messages WHERE turn_id = $1", [turn.turn_id]);
+  const messages = { rows: allTurnMessages.rows.filter(row => row.role === "assistant") };
+  const persistedTurn = await store.pool.query("SELECT assistant_archive_message_id, status FROM archive_turns WHERE turn_id = $1", [turn.turn_id]);
+  assert.equal(messages.rows.length, 1);
+  assert.equal(messages.rows[0].canonical, true);
+  assert.equal(persistedTurn.rows[0].assistant_archive_message_id, messages.rows[0].archive_message_id);
+  assert.equal(persistedTurn.rows[0].status, "assistant_complete");
+  await service.close();
+});
+
+test("ambiguous repeated rolling overlap cannot append context or regress the canonical tail", async () => {
+  const { service } = makeArchive();
+  const first = service.captureChatRequest(captureInput([
+    { role: "user", content: "A" },
+    { role: "assistant", content: "B" },
+    { role: "user", content: "A" }
+  ]));
+  await first.archiveAssistant("B");
+  const second = service.captureChatRequest(captureInput([
+    { role: "user", content: "A" },
+    { role: "assistant", content: "B" },
+    { role: "user", content: "A" },
+    { role: "assistant", content: "B" },
+    { role: "user", content: "新的真实消息" }
+  ], { observedAt: new Date("2026-08-20T10:03:00.000Z") }));
+  await second.archiveAssistant("新回复");
+  await service.flush();
+  const page = await listAll(service);
+  assert.deepEqual(page.messages.map(row => row.content_text), ["A", "B", "A", "B", "新的真实消息", "新回复"]);
+  assert.equal(page.messages[4].reconcile_status, "ambiguous_overlap");
+  assert.equal(resolveRollingOverlap(
+    ["A", "B", "A", "B"].map((content, index) => messageIdentity({ role: index % 2 === 0 ? "user" : "assistant", content })),
+    ["A", "B", "A", "B"].map((content, index) => messageIdentity({ role: index % 2 === 0 ? "user" : "assistant", content }))
+  ).kind, "AMBIGUOUS");
+  await service.close();
+});
+
+test("stale rolling window cannot append old context or move conversation sequence backwards", async () => {
+  const { store, service } = makeArchive();
+  await store.pool.query("INSERT INTO archive_conversations (conversation_id, next_sequence) VALUES ($1, $2)", ["conversation-A", 101]);
+  for (let sequence = 1; sequence <= 100; sequence += 1) {
+    await store.pool.query(
+      `INSERT INTO archive_messages (
+        archive_message_id, conversation_id, role, content_text, content_json, source,
+        observed_at, sequence, fingerprint, canonical, confirmed, completion_status,
+        delivery_status, reconcile_status, metadata_json
+      ) VALUES ($1, $2, 'user', $3, $4::jsonb, 'test', $5, $6, $7, TRUE, TRUE, 'not_applicable', 'not_applicable', 'direct', '{}'::jsonb)`,
+      [crypto.randomUUID(), "conversation-A", `m${sequence}`, JSON.stringify(`m${sequence}`), "2026-08-20T10:00:00.000Z", sequence, contentFingerprint("user", `m${sequence}`)]
+    );
+  }
+  const stale = Array.from({ length: 40 }, (_, index) => ({ role: "user", content: `m${index + 40}` }));
+  stale.push({ role: "user", content: "m101" });
+  const turn = await store.captureIncomingTurn(captureInput(stale, { observedAt: new Date("2026-08-20T10:10:00.000Z") }));
+  assert.equal(turn.deduped, false);
+  const state = await store.pool.query("SELECT next_sequence FROM archive_conversations WHERE conversation_id = $1", ["conversation-A"]);
+  const reconciled = await store.pool.query("SELECT COUNT(*)::int AS count FROM archive_messages WHERE source = 'reconciled_context'");
+  const newest = await store.pool.query("SELECT sequence, content_text FROM archive_messages ORDER BY sequence DESC LIMIT 1");
+  assert.equal(state.rows[0].next_sequence, 102);
+  assert.equal(reconciled.rows[0].count, 0);
+  assert.deepEqual(newest.rows[0], { sequence: 101, content_text: "m101" });
+  await service.close();
+});
+
+test("conflict resolution retains duplicate rows while default queries expose canonical logical history", async () => {
+  const { store, service } = makeArchive();
+  const first = service.captureChatRequest(captureInput([{ role: "user", content: "重试候选" }]));
+  await first.archiveAssistant("答复一");
+  const second = service.captureChatRequest(captureInput([{ role: "user", content: "重试候选" }], { observedAt: new Date("2026-08-20T10:00:01.000Z") }));
+  await second.archiveAssistant("答复二");
+  await service.flush();
+  const conflict = (await store.pool.query("SELECT conflict_id FROM archive_reconciliation_conflicts WHERE reason = 'possible_transport_retry_unproven'")).rows[0];
+  await store.resolveConflict({ conflict_id: conflict.conflict_id, status: "resolved_duplicate", resolution_metadata: { proof: "test" } });
+  const canonical = await listAll(service);
+  const all = await service.listMessages({ conversation_id: "conversation-A", date: null, dateRange: null, limit: 100, cursor: null, include_duplicates: true });
+  assert.equal(canonical.messages.length, 2);
+  assert.equal(all.messages.length, 4);
+  assert.equal((await service.stats({ conversation_id: "conversation-A", dateRange: null })).total, 2);
+  assert.equal((await service.stats({ conversation_id: "conversation-A", dateRange: null, include_duplicates: true })).total, 4);
+  await service.close();
+});
+
+test("proactive event seen again in rolling context stays a single archive row", async () => {
+  const { service } = makeArchive();
+  await service.captureProactive({
+    conversation_id: "conversation-A",
+    assistant_id: "ayan",
+    content: "主动消息",
+    external_event_id: "22222222-2222-4222-8222-222222222222",
+    message_time: "2026-08-20T12:00:00.000Z"
+  });
+  const capture = service.captureChatRequest(captureInput([
+    { role: "assistant", content: "主动消息" },
+    { role: "user", content: "我收到了" }
+  ]));
+  await capture.archiveAssistant("好的");
+  await service.flush();
+  const page = await listAll(service);
+  assert.equal(page.messages.filter(row => row.content_text === "主动消息").length, 1);
+  await service.close();
+});
+
+test("stream collector distinguishes complete, EOF partial, reader error, client disconnect, multiline data, and split chunks", () => {
+  const complete = new SseAssistantCollector();
+  complete.feed(Buffer.from(": comment\n\nevent: message\ndata: {\"choices\":[\n"));
+  complete.feed(Buffer.from("data: {\"delta\":{\"content\":\"你\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"好\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"));
+  assert.equal(complete.finish(), "你好");
+  assert.deepEqual(complete.archiveOutcome(), {
+    content: "你好",
+    has_payload: true,
+    completion_status: "complete",
+    confirmed: true,
+    delivery_status: "unknown",
+    termination_reason: "sse_done",
+    structured_deltas: []
+  });
+
+  const eof = new SseAssistantCollector();
+  eof.feed(Buffer.from("data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n\n"));
+  eof.finish();
+  assert.equal(eof.archiveOutcome().completion_status, "partial");
+  assert.equal(eof.archiveOutcome().confirmed, false);
+  assert.equal(eof.archiveOutcome().termination_reason, "eof_without_completion_marker");
+  assert.equal(eof.archiveOutcome({ upstreamReadError: true }).termination_reason, "upstream_read_error");
+  assert.equal(eof.archiveOutcome({ clientDisconnected: true }).delivery_status, "unconfirmed");
+});
+
+test("structured tool-call assistant is retained without fabricated text", async () => {
+  const { service, store } = makeArchive();
+  const capture = service.captureChatRequest(captureInput([{ role: "user", content: "调用工具" }]));
+  await capture.archiveAssistant({
+    content: "",
+    completion_status: "complete",
+    confirmed: true,
+    metadata_json: { structured_assistant: { tool_calls: [{ id: "call_1", type: "function", function: { name: "weather", arguments: "{}" } }] } }
+  });
+  await service.flush();
+  const message = (await store.pool.query("SELECT content_text, metadata_json FROM archive_messages WHERE role = 'assistant'")).rows[0];
+  assert.equal(message.content_text, "");
+  assert.match(JSON.stringify(message.metadata_json), /call_1/);
+  await service.close();
 });

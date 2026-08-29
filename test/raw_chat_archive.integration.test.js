@@ -32,7 +32,9 @@ archiveStore.migrated = true;
 rawChatArchive.store = archiveStore;
 
 const originalFetch = global.fetch;
+let upstreamOverride = null;
 global.fetch = async (url, options = {}) => {
+  if (upstreamOverride) return upstreamOverride(url, options);
   assert.equal(String(url), upstreamUrl);
   const request = JSON.parse(options.body);
   if (request.stream) {
@@ -134,4 +136,76 @@ test("archive routes reject absent and gateway-only keys, paginate stably, and r
   });
   assert.equal(stats.statusCode, 200);
   assert.deepEqual(JSON.parse(stats.body).total, 4);
+});
+
+test("Gateway archives EOF-without-DONE and upstream reader errors as explicit partial assistants", async () => {
+  try {
+    upstreamOverride = async () => new Response(
+      "data: {\"choices\":[{\"delta\":{\"content\":\"EOF 半截\"}}]}\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } }
+    );
+    const eof = await chat([{ role: "user", content: "EOF 请求" }], { stream: true });
+    assert.equal(eof.statusCode, 200);
+    await rawChatArchive.flush();
+
+    let emittedReaderChunk = false;
+    upstreamOverride = async () => new Response(new ReadableStream({
+      pull(controller) {
+        if (!emittedReaderChunk) {
+          emittedReaderChunk = true;
+          controller.enqueue(new TextEncoder().encode("data: {\"choices\":[{\"delta\":{\"content\":\"错误半截\"}}]}\n\n"));
+          return;
+        }
+        controller.error(Object.assign(new Error("read failed"), { code: "ECONNRESET" }));
+      }
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    const errored = await chat([{ role: "user", content: "错误请求" }], { stream: true });
+    assert.equal(errored.statusCode, 200);
+    await rawChatArchive.flush();
+
+    const partials = await rawChatArchive.store.pool.query(
+      "SELECT content_text, completion_status, confirmed, metadata_json FROM archive_messages WHERE completion_status = 'partial' ORDER BY sequence"
+    );
+    assert.deepEqual(partials.rows.map(row => [row.content_text, row.completion_status, row.confirmed]), [
+      ["EOF 半截", "partial", false],
+      ["错误半截", "partial", false]
+    ]);
+    assert.match(JSON.stringify(partials.rows[1].metadata_json), /upstream_read_error/);
+  } finally {
+    upstreamOverride = null;
+  }
+});
+
+test("Gateway archives tool-call-only assistant structure without inventing text", async () => {
+  try {
+    upstreamOverride = async () => new Response(JSON.stringify({
+      choices: [{ message: { role: "assistant", tool_calls: [{ id: "call_archive", type: "function", function: { name: "lookup", arguments: "{}" } }] } }]
+    }), { status: 200, headers: { "content-type": "application/json" } });
+    const response = await chat([{ role: "user", content: "结构化请求" }]);
+    assert.equal(response.statusCode, 200);
+    await rawChatArchive.flush();
+    const row = (await rawChatArchive.store.pool.query(
+      "SELECT content_text, metadata_json FROM archive_messages WHERE source = 'gateway_assistant' ORDER BY sequence DESC LIMIT 1"
+    )).rows[0];
+    assert.equal(row.content_text, "");
+    assert.match(JSON.stringify(row.metadata_json), /call_archive/);
+  } finally {
+    upstreamOverride = null;
+  }
+});
+
+test("archive-disabled streaming EOF without assistant data remains a normal Gateway response", async () => {
+  const enabled = rawChatArchive.enabled;
+  try {
+    rawChatArchive.enabled = false;
+    upstreamOverride = async () => new Response("", {
+      status: 200,
+      headers: { "content-type": "text/event-stream" }
+    });
+    const response = await chat([{ role: "user", content: "禁用态空流" }], { stream: true });
+    assert.equal(response.statusCode, 200);
+  } finally {
+    rawChatArchive.enabled = enabled;
+    upstreamOverride = null;
+  }
 });

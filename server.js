@@ -20,7 +20,7 @@ const {
 const { authorizeArchiveRequest } = require("./archive/archive_auth");
 const { SseAssistantCollector } = require("./archive/archive_stream");
 const { registerArchiveRoutes } = require("./archive/archive_routes");
-const { RawChatArchiveService, buildChatCaptureInput } = require("./archive/archive_sync");
+const { RawChatArchiveService, buildChatCaptureInput, extractClientRequestId } = require("./archive/archive_sync");
 const {
   loadKelivoSyncContext,
   parseKelivoSyncHeaders,
@@ -97,11 +97,22 @@ function isInputValidationError(error) {
   return error?.code === "PROACTIVE_EVENT_VALIDATION" || error?.code === "KELIVO_SYNC_CONTEXT_VALIDATION";
 }
 
-function extractAssistantContentFromUpstream(responseText, contentType) {
+function extractAssistantArchivePayload(responseText, contentType) {
   const parsed = parseChatCompletionResponse(responseText, contentType);
   const message = parsed?.choices?.[0]?.message;
-  if (!message || !Object.prototype.hasOwnProperty.call(message, "content")) return null;
-  return normalizeContentToText(message.content);
+  if (!message) return null;
+  const hasContent = Object.prototype.hasOwnProperty.call(message, "content");
+  const structured = {};
+  for (const key of ["tool_calls", "function_call", "refusal", "audio", "annotations"]) {
+    if (message[key] != null) structured[key] = message[key];
+  }
+  if (!hasContent && Object.keys(structured).length === 0) return null;
+  return {
+    content: hasContent ? message.content : "",
+    completion_status: "complete",
+    confirmed: true,
+    metadata_json: Object.keys(structured).length > 0 ? { structured_assistant: structured } : {}
+  };
 }
 
 function normalizeWakeProactivePayload(value) {
@@ -764,7 +775,8 @@ app.post("/v1/chat/completions", async (req, reply) => {
       messages: kelivoMessages,
       timestampDb: tsDB,
       timeZone: TIME_ZONE,
-      observedAt: requestReceivedAt
+      observedAt: requestReceivedAt,
+      clientRequestId: extractClientRequestId(req.headers)
     }));
 
     // 缺失 Header 的旧 Kelivo 保持完全兼容；只有真实 user 回合才更新持久化绑定。
@@ -884,8 +896,8 @@ app.post("/v1/chat/completions", async (req, reply) => {
       const responseText = await response.text();
       if (response.ok) {
         try {
-          const assistantContent = extractAssistantContentFromUpstream(responseText, upstreamContentType);
-          if (assistantContent != null) archiveCapture.archiveAssistant(assistantContent, { observedAt: new Date() });
+          const assistantPayload = extractAssistantArchivePayload(responseText, upstreamContentType);
+          if (assistantPayload != null) archiveCapture.archiveAssistant(assistantPayload, { observedAt: new Date() });
         } catch {
           console.warn(JSON.stringify({ event: "archive_assistant_extract_failed", error_category: "upstream_response_unreadable" }));
         }
@@ -908,16 +920,54 @@ app.post("/v1/chat/completions", async (req, reply) => {
 
     const reader = response.body.getReader();
     const archiveStreamCollector = new SseAssistantCollector();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      reply.raw.write(value);
-      archiveStreamCollector.feed(value);
+    let clientDisconnected = false;
+    let upstreamReadError = null;
+    const onClientClose = () => {
+      if (!reply.raw.writableEnded) clientDisconnected = true;
+    };
+    reply.raw.once("close", onClientClose);
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        archiveStreamCollector.feed(value);
+        if (!clientDisconnected && !reply.raw.destroyed && !reply.raw.writableEnded) {
+          try {
+            reply.raw.write(value);
+          } catch {
+            clientDisconnected = true;
+            console.warn(JSON.stringify({ event: "stream_client_delivery_interrupted" }));
+          }
+        }
+      }
+    } catch (error) {
+      upstreamReadError = error;
+      console.warn(JSON.stringify({ event: "upstream_stream_read_failed", error_category: error?.code || "upstream_stream_error" }));
+    } finally {
+      reply.raw.removeListener("close", onClientClose);
     }
-    reply.raw.end();
+    if (!clientDisconnected && !reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.end();
     if (response.ok) {
-      const assistantContent = archiveStreamCollector.finish();
-      if (archiveStreamCollector.sawContent) archiveCapture.archiveAssistant(assistantContent, { observedAt: new Date() });
+      archiveStreamCollector.finish();
+      const outcome = archiveStreamCollector.archiveOutcome({ upstreamReadError: Boolean(upstreamReadError), clientDisconnected });
+      if (outcome.has_payload) {
+        archiveCapture.archiveAssistant({
+          content: outcome.content,
+          completion_status: outcome.completion_status,
+          confirmed: outcome.confirmed,
+          delivery_status: outcome.delivery_status,
+          metadata_json: {
+            termination_reason: outcome.termination_reason,
+            structured_stream_deltas: outcome.structured_deltas
+          }
+        }, { observedAt: new Date() });
+      } else if (!outcome.confirmed) {
+        archiveCapture.archiveAssistantTerminal({
+          observedAt: new Date(),
+          status: upstreamReadError ? "assistant_failed" : "assistant_interrupted",
+          metadata: { termination_reason: outcome.termination_reason, client_delivery_status: outcome.delivery_status }
+        });
+      }
     }
   } catch (err) {
     console.error(err);

@@ -24,6 +24,24 @@ function stableStringify(value) {
   return JSON.stringify(stableValue(value));
 }
 
+function normalizeClientRequestId(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== "string") return null;
+  const normalized = raw.trim();
+  if (!normalized || normalized.length > 128 || /[\u0000-\u001F\u007F]/.test(normalized)) return null;
+  return normalized;
+}
+
+function extractClientRequestId(headers = {}) {
+  // Kelivo does not currently provide one. These standard/forward-compatible
+  // headers are optional; without one Archive intentionally does not dedupe.
+  return normalizeClientRequestId(
+    headers["idempotency-key"] ||
+    headers["x-kelivo-request-id"] ||
+    headers["x-request-id"]
+  );
+}
+
 function isArchiveChatMessage(message) {
   if (!message || message.tool_calls) return false;
   if (message.role === "user") return isRealUserMessageForTimeline(message);
@@ -38,7 +56,7 @@ function knownMessageTime(message, timestampDb, timeZone) {
   return fromMemory ? fromMemory.toISOString() : null;
 }
 
-function buildChatCaptureInput({ binding, messages, timestampDb = {}, timeZone, observedAt = new Date() }) {
+function buildChatCaptureInput({ binding, messages, timestampDb = {}, timeZone, observedAt = new Date(), clientRequestId = null }) {
   if (!binding?.provided || !binding.conversation_id) return null;
   const eligible = (Array.isArray(messages) ? messages : []).filter(isArchiveChatMessage);
   if (eligible.at(-1)?.role !== "user") return null;
@@ -52,11 +70,13 @@ function buildChatCaptureInput({ binding, messages, timestampDb = {}, timeZone, 
     version: 1,
     conversation_id: binding.conversation_id,
     assistant_id: binding.assistant_id || null,
+    client_request_id: normalizeClientRequestId(clientRequestId),
     messages: eligible.map(messageIdentity)
   }));
   return {
     conversation_id: binding.conversation_id,
     assistant_id: binding.assistant_id || null,
+    client_request_id: normalizeClientRequestId(clientRequestId),
     observed_at: new Date(observedAt).toISOString(),
     visible_context: visible,
     latest_user: {
@@ -82,24 +102,39 @@ class ArchiveChatCapture {
     this.turnResult = service.schedule("incoming_turn", () => service.runForConversation(input.conversation_id, () => service._captureIncoming(input)));
   }
 
-  archiveAssistant(content, { observedAt = new Date(), metadata = {} } = {}) {
+  archiveAssistant(payload, { observedAt = new Date(), metadata = {} } = {}) {
+    const assistant = payload && typeof payload === "object" && !Array.isArray(payload) && Object.prototype.hasOwnProperty.call(payload, "content")
+      ? payload
+      : { content: payload };
     return this.service.schedule("assistant", async () => {
       let turn = await this.turnResult;
       if (!turn?.turn_id) turn = await this.service.runForConversation(this.input.conversation_id, () => this.service._captureIncoming(this.input));
       if (!turn?.turn_id) return { skipped: true };
-      return this.service._captureAssistant(turn.turn_id, content, observedAt, metadata);
+      return this.service._captureAssistant(turn.turn_id, {
+        ...assistant,
+        observed_at: observedAt,
+        metadata_json: { ...(assistant.metadata_json || {}), ...metadata }
+      });
+    });
+  }
+
+  archiveAssistantTerminal({ observedAt = new Date(), status, metadata = {} } = {}) {
+    return this.service.schedule("assistant_terminal", async () => {
+      let turn = await this.turnResult;
+      if (!turn?.turn_id) turn = await this.service.runForConversation(this.input.conversation_id, () => this.service._captureIncoming(this.input));
+      if (!turn?.turn_id) return { skipped: true };
+      return this.service._markAssistantTerminal(turn.turn_id, { observed_at: observedAt, status, metadata_json: metadata });
     });
   }
 }
 
 class RawChatArchiveService {
-  constructor({ enabled = readBoolean(process.env.ARCHIVE_ENABLED), databaseUrl = process.env.ARCHIVE_DATABASE_URL, store = null, poolFactory = null, logger = console, retryWindowMs } = {}) {
+  constructor({ enabled = readBoolean(process.env.ARCHIVE_ENABLED), databaseUrl = process.env.ARCHIVE_DATABASE_URL, store = null, poolFactory = null, logger = console } = {}) {
     this.enabled = Boolean(enabled) && Boolean(String(databaseUrl || "").trim() || store);
     this.databaseUrl = String(databaseUrl || "").trim();
     this.store = store;
     this.poolFactory = poolFactory;
     this.logger = logger;
-    this.retryWindowMs = retryWindowMs;
     this.pending = new Set();
     this.conversationQueues = new Map();
     this.initializing = null;
@@ -141,7 +176,7 @@ class RawChatArchiveService {
             statement_timeout: 5000
           });
         }
-        const store = new ArchiveStore({ pool, retryWindowMs: this.retryWindowMs });
+        const store = new ArchiveStore({ pool });
         await store.migrate();
         this.store = store;
         return store;
@@ -160,9 +195,14 @@ class RawChatArchiveService {
     return store.captureIncomingTurn(input);
   }
 
-  async _captureAssistant(turnId, content, observedAt, metadata) {
+  async _captureAssistant(turnId, input) {
     const store = await this._ensureStore();
-    return store.captureAssistantForTurn({ turn_id: turnId, content, observed_at: observedAt, metadata_json: metadata });
+    return store.captureAssistantForTurn({ turn_id: turnId, ...input });
+  }
+
+  async _markAssistantTerminal(turnId, input) {
+    const store = await this._ensureStore();
+    return store.markAssistantTerminal({ turn_id: turnId, ...input });
   }
 
   schedule(kind, operation) {
@@ -174,6 +214,9 @@ class RawChatArchiveService {
         return result;
       })
       .catch(error => {
+        if (error?.archive_migration) {
+          this._safeLog("warn", { event: "archive_migration_failed", error_category: errorCategory(error) });
+        }
         this._safeLog("warn", { event: "archive_write_failed", kind, error_category: errorCategory(error) });
         return { skipped: true, error_category: errorCategory(error) };
       });
@@ -196,11 +239,17 @@ class RawChatArchiveService {
   captureChatRequest(input) {
     if (!input) {
       this._safeLog("log", { event: "archive_chat_skipped", reason: "missing_bound_final_user_turn" });
-      return { archiveAssistant: () => Promise.resolve({ skipped: true }) };
+      return {
+        archiveAssistant: () => Promise.resolve({ skipped: true }),
+        archiveAssistantTerminal: () => Promise.resolve({ skipped: true })
+      };
     }
     if (!this.enabled) {
       this._disabled();
-      return { archiveAssistant: () => Promise.resolve({ skipped: true }) };
+      return {
+        archiveAssistant: () => Promise.resolve({ skipped: true }),
+        archiveAssistantTerminal: () => Promise.resolve({ skipped: true })
+      };
     }
     return new ArchiveChatCapture(this, input);
   }
@@ -237,6 +286,7 @@ module.exports = {
   RawChatArchiveService,
   buildChatCaptureInput,
   errorCategory,
+  extractClientRequestId,
   isArchiveChatMessage,
   knownMessageTime,
   stableStringify

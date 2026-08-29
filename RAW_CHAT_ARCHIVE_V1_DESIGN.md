@@ -1,200 +1,207 @@
 # Raw Chat Archive V1A design
 
-## Scope
+## Scope and safety boundary
 
-V1A is an append-only PostgreSQL factual archive for Dylan Heartbeat Kelivo
-conversations from the day it is enabled. It records real `user`, normal
-gateway `assistant`, and successfully delivered Heartbeat proactive assistant
-messages. It is not `enhanced_messages.json`, Ombre Brain, an embedding store,
-summary system, ranking system, deletion policy, or V1B historical importer.
+V1A is an append-only PostgreSQL factual archive for Kelivo conversations
+observed by Dylan Heartbeat after Archive is enabled. It records bound live
+user turns, gateway assistant results, and successfully created proactive
+events. It is separate from `enhanced_messages.json`, timeline context,
+timestamp memory, V1B import, and Ombre Brain. It does not summarize, embed,
+rank, delete, or rewrite a message.
 
-The runtime rule is **CHAT FIRST, ARCHIVE SECOND**. Archive work is
-background work. Its errors are content-free structured logs and must never
-become a chat, stream, Heartbeat, Bark/ntfy, sync, or binding error.
+The runtime rule is **CHAT FIRST, ARCHIVE SECOND**. Archive work is scheduled
+after the current request path has the required data and never changes the
+payload sent to the upstream model or bytes sent to Kelivo. Database, migration,
+or reconciliation errors are content-free structured logs only.
 
-## Existing flow reviewed
+## Existing gateway flow
 
-`POST /v1/chat/completions` currently:
+`POST /v1/chat/completions` validates the optional existing Kelivo conversation
+binding, updates timestamp memory only for the latest real user message, builds
+the existing clipped timeline, preserves the original multimodal payload, and
+forwards it to `TARGET_API_URL`. Non-stream bodies are returned unchanged. SSE
+bytes are written to Kelivo as they arrive. Archive observes the original bound
+request and the actual upstream result after this flow; it never increases the
+Kelivo context window.
 
-1. Logs a safe request summary, validates optional
-   `X-Kelivo-Conversation-Id`/`X-Kelivo-Assistant-Id`, and updates the
-   current sync binding only when the final real message is a user message.
-2. Updates timestamp memory only for content timestamps and the latest real
-   user's first receipt. Historical rolling-context entries are never assigned
-   the current time.
-3. Builds `enhanced_messages.json` for current context assistance and keeps
-   its system prompt plus only the last 49 non-system entries. It remains an
-   independent rolling-context helper, never an archive.
-4. Preserves compatible multimodal content for the upstream, injects special
-   wake events, removes invalid tool-call runs, and forwards to
-   `TARGET_API_URL`.
-5. Returns a non-stream upstream body unchanged; for SSE it writes every
-   upstream byte to Kelivo as it arrives.
+`/internal/wake-event` remains responsible for the existing wake/timeline/
+proactive-event behavior. Only after `appendProactiveEvent()` succeeds is its
+body scheduled as `heartbeat_proactive`; its real `event_id` is the archive
+`external_event_id`. Archive failure therefore cannot break Bark, the event,
+or proactive sync.
 
-Archive observes the original Kelivo request and the actual completion only.
-It does not alter timeline length, upstream messages, model configuration, or
-upstream response bytes.
+## Identity and schema
 
-## Conversation identity
+`001_initial.sql` creates:
 
-Normal Kelivo chat supplies the existing validated conversation header and an
-optional assistant header. V1A archives only a valid bound conversation.
-Headerless legacy calls continue to work without change and emit a safe
-`archive_chat_skipped` reason: inventing a conversation ID would make exact
-history retrieval unreliable. The existing `kelivo_sync_context` remains the
-source for Heartbeat's valid proactive binding; it is never used to guess a
-missing chat header.
+* `archive_conversations`: conversation-scoped monotonic `next_sequence`.
+* `archive_turns`: one observed live user candidate, its exact assistant link,
+  request/context evidence, canonical state, and terminal state.
+* `archive_messages`: immutable factual rows with role, safe content, UTC
+  times, monotonic sequence, source, confirmation/completion/delivery state,
+  `turn_id`, and canonical flag.
+* `archive_reconciliation_conflicts`: content-free candidate relationship and
+  lifecycle record.
+* `archive_schema_migrations`: applied versioned SQL files.
 
-## PostgreSQL model
+`archive_messages.turn_id` is an FK to `archive_turns`. A turn's user and
+assistant UUID links are FKs back to messages. All use `ON DELETE RESTRICT`:
+Archive never physically deletes factual history, and the database must reject
+an orphaning delete. A turn is inserted first in the same transaction, then its
+user message, then the turn's user link, avoiding a deferred-FK cycle.
 
-`migrations/001_initial.sql` creates:
+Partial unique indexes enforce one canonical user and one canonical assistant
+per `turn_id`; the proactive `external_event_id` is globally unique only when
+non-null. `(conversation_id, client_request_id)` is unique only when an actual
+stable request ID is supplied. Canonical messages are indexed by conversation
+time/sequence and turn ID for query and reconciliation access.
 
-* `archive_messages`: UUID message identity, conversation/assistant identity,
-  role, `content_text`, safe `content_json`, source, UTC `message_time`, UTC
-  `observed_at`, monotonic conversation `sequence`, diagnostic fingerprint,
-  optional `turn_key`, optional `external_event_id`, confirmation and
-  reconciliation fields, metadata, and UTC audit timestamps.
-* `archive_turns`: one observed user turn and its actual gateway assistant
-  completion; unique `(conversation_id, request_key)`, predecessor sequence,
-  request-context digest, status, and message UUID links.
-* `archive_conversations`: an atomic next-sequence counter, avoiding races
-  from Windows and iPhone concurrently writing one conversation.
-* `archive_reconciliation_conflicts`: content-free evidence for a window that
-  cannot be proven to align; it is not a hidden hash-dedupe table.
+## User turns, retries, and candidates
 
-Indexes cover `(conversation_id, message_time)`,
-`(conversation_id, sequence)`, assistant ID, request key, and a partial unique
-non-null `external_event_id`. `turns` is intentionally used: it makes retry
-handling, stream pairing, and incomplete turn diagnosis reliable without
-using a content hash as message identity.
+Only a final real user message for a valid conversation binding starts a live
+turn. First sight of an existing conversation stores the visible pre-anchor
+window once as `initial_context_seed`; unknown historic message times remain
+`NULL` while `observed_at` records when the gateway saw them. V1B owns complete
+pre-V1A import.
 
-## Content and privacy
+The gateway accepts `Idempotency-Key`, `X-Kelivo-Request-Id`, or `X-Request-Id`
+only when non-empty and valid. A prior matching value in the same conversation
+is deterministic retry evidence and can reuse its existing `turn_id`. Kelivo
+currently does not send one, so this path is normally unavailable.
 
-String content is retained as text. Array/multimodal content uses the existing
-`normalizeContentToText()` for `content_text` and stores a structurally
-preserved `content_json`. Image data URLs are replaced there with MIME type,
-byte estimate, SHA-256, and a placeholder: base64 is never copied into
-PostgreSQL. Normal URLs, text parts, and descriptions remain available. The
-upstream receives the original multimodal payload unchanged.
+Without that stable ID, **UNCERTAIN IS NOT DUPLICATE**. Neither content,
+fingerprint, full context digest, predecessor, nor elapsed time (including a
+10-minute window) suppresses a new user row. A same-context candidate is
+written as a distinct turn/message with `reconcile_status=possible_retry` and
+an open conflict referencing the plausible prior turn. Two real short `嗯`
+turns are therefore retained even when identical.
 
-Archive logs event names, role, count, binding flags, durations, and error
-categories only. It never logs content, system prompts, credentials,
-database URLs, keys, raw messages, or base64.
+`request_key` includes conversation, assistant, predecessor sequence, and the
+ordered request digest, but is diagnostic/turn pairing material, not proof of
+a transport retry without client identity.
 
-## Live turns, rolling windows, and retries
+## Conflict lifecycle and logical history
 
-Only a final real user message starts a live turn. System/tool messages and
-internal special-event markers are not archived as ordinary chat. On the first
-V1A request for a conversation, visible real messages before that anchor are
-written once as `initial_context_seed` in visible order. Their `message_time`
-is a parsed/remembered time only when proven; otherwise it is `NULL` and
-`observed_at` records gateway observation. The latest user is then recorded as
-`kelivo_live_user` at gateway receipt time. V1B owns the older complete import.
+Conflicts start `open` and contain no chat body. They record candidate turn,
+related turn where known, reason, observed time, and safe evidence metadata.
+Supported outcomes are `resolved_distinct`, `resolved_duplicate`, `superseded`,
+and `manual_review`, together with resolver, resolution time, and metadata.
 
-For an existing conversation, V1A compares the current visible pre-anchor
-window to the tail of the archived ordered message stream. A reliable
-multi-message, role-and-content, ordered suffix/prefix overlap confirms the
-existing rows; only an unmatched suffix is added as `reconciled_context`.
-A full overlap writes no rolling-context rows. Comparison is tied to the
-conversation tail and order, not to one message text, so the same window from
-Windows and iPhone safely reconciles.
+Resolving a candidate as a confirmed transport duplicate sets its turn and
+messages `canonical=false`, links `duplicate_of_turn_id`, and retains every
+physical row. Resolving distinct keeps it canonical. No automated reconciler
+claims this proof in V1A; a future evidence-aware worker or manual process may
+do so. This prevents guessed dedupe from becoming data loss.
 
-Each turn gets `request_key = hash(conversation, assistant, predecessor
-sequence, ordered request window, latest user)`. `archive_turns` stores this
-key plus a complete request-context digest. A short, exact repeat uses the
-known turn and does not insert a second user/assistant pair. This is a request
-turn identity, not a unique key on `role + content`.
+Archive messages/stats default to canonical logical history. Open ambiguous
+candidates remain canonical and are never hidden. `include_duplicates=true`
+is archive-key-protected and returns the retained physical audit rows; its
+value is bound into the signed cursor.
 
-Two actual `嗯` user messages remain distinct: the normal second one has a
-different predecessor sequence and hence a different turn key. The same is
-true of repeated assistant short replies. Fingerprints exist only for
-diagnostics/reconciliation, never as global unique message keys.
+## Rolling context and multiple devices
 
-Kelivo currently has no client request UUID or per-message UUID. Therefore an
-exact full-window replay within the retry interval cannot be mathematically
-distinguished from an immediate identical new turn. V1A performs bounded retry
-dedupe for that common transport case and records an explicit reconciliation
-audit record instead of claiming proof. Outside that window, or with an
-insufficient/ambiguous overlap, it retains a new conflict-marked turn rather
-than silently discarding history using content hash. A later optional Kelivo
-request ID can eliminate this protocol ambiguity without schema changes.
+For an existing conversation, the visible pre-anchor window is compared to the
+last 80 canonical rows. Resolution is one of:
 
-`confirmed` means directly observed on the gateway path or later observed in
-an aligned context. `reconcile_status` distinguishes `direct`, `seeded`,
-`reconciled`, and `conflict`.
+* `RELIABLE`: exactly one suffix/prefix alignment, at least three messages,
+  unique in the retained tail, and covering the full visible window or at least
+  75 percent of it. Only then can an unmatched suffix be saved as
+  `reconciled_context`.
+* `AMBIGUOUS`: repeated candidate patterns or weak overlap. No context is
+  appended and no predecessor is inferred; the latest real user is still saved
+  as an `ambiguous_overlap` candidate plus conflict.
+* `NONE`: no alignment. Old visible context is not appended; a mismatching
+  window is conflict evidence, while the newest real user remains a new turn.
 
-## Assistant and proactive write paths
+The conversation row is locked with `SELECT ... FOR UPDATE` before incoming
+reconciliation and sequence allocation. This makes sequence monotonic across
+Windows and iPhone. A stale device window cannot rewrite or move the canonical
+tail backward; it can only yield a new live user candidate and conflict.
 
-The user capture is scheduled as soon as a valid request arrives, but it is
-not awaited before upstream forwarding. After a successful non-stream body is
-read, a copy is parsed only to extract assistant text; the original body is
-still returned unchanged. For SSE, every byte still reaches Kelivo immediately
-while an internal collector joins `delta.content`. Only after normal stream
-completion and `reply.raw.end()` is the assistant capture scheduled. Migration,
-database, parsing, or insert errors cannot delay tokens or change a completed
-stream into an error. A later assistant operation retries its paired user write
-first, so a recovered database can save the current completed turn.
+## Assistant pairing and structured responses
 
-The existing proactive flow remains model decision -> successful Bark/ntfy ->
-internal wake event -> timeline special event -> proactive event. Only after
-`appendProactiveEvent` succeeds does V1A schedule the delivered assistant body
-as `heartbeat_proactive`. Its stable proactive `event_id` becomes
-`external_event_id`, whose unique index prevents duplicate archive rows.
-Archive failure occurs after, and cannot affect, successful current behavior.
+The live request lifecycle retains the exact `turn_id` returned by
+`captureIncomingTurn()` and passes it to `captureAssistantForTurn()`. It never
+searches for a "latest awaiting" turn. The assistant write transaction locks
+that turn with `SELECT ... FOR UPDATE`, checks the stored assistant link,
+inserts exactly one canonical assistant when absent, updates the link/status,
+then commits. A per-process turn queue and PostgreSQL partial unique index are
+additional defences across local and multi-instance concurrency.
 
-## Fault isolation, migrations, and rollback
+Assistant text is stored unchanged. A non-stream assistant with only
+`tool_calls`, `function_call`, refusal/audio/annotation structure, or other
+meaningful structured data is still archived with empty `content_text` and
+safe structured metadata. It is never converted into invented natural
+language.
 
-Archive activates only with `ARCHIVE_ENABLED=true` and a non-empty
-`ARCHIVE_DATABASE_URL`; otherwise it is disabled, logs safely, and the gateway
-starts/chats/wakes/syncs exactly as before. A small timeout-bounded pool runs
-versioned SQL migrations recorded in `archive_schema_migrations`. Migration is
-lazy, nonfatal, and retryable: failure makes Archive degraded only. Fastify
-close closes the archive pool.
+## SSE completion and delivery state
 
-Rollback is `ARCHIVE_ENABLED=false` plus restart. It is non-destructive: data
-and migrations remain intact for a later re-enable. Later schema changes are
-additive, versioned, and recorded.
+The compact SSE collector supports comments, `event`/`id`/`retry` fields,
+multi-line `data` events, chunk boundaries, `[DONE]`, `finish_reason`, text
+deltas, and structured deltas. It is observational: every upstream chunk is
+written immediately before Archive is scheduled.
 
-## Read API, pagination, and time
+Only `[DONE]` or an explicit non-null `finish_reason` proves
+`completion_status=complete` and `confirmed=true`. EOF alone is not proof. If
+text/structured content exists at EOF without a completion marker, it is stored
+as `partial`, `confirmed=false`, and the turn is `assistant_partial`. A reader
+error with received content is also partial with
+`termination_reason=upstream_read_error`; with no content it records an
+`assistant_failed`/`assistant_interrupted` terminal turn instead of completion.
 
-`GET /v1/archive/messages` accepts `conversation_id`, optional strict
-`date=YYYY-MM-DD`, bounded `limit`, and a signed keyset `cursor`.
-`GET /v1/archive/stats` accepts conversation/date filters and returns totals,
-role counts, and first/last known message time. Both require exactly
-`Authorization: Bearer <ARCHIVE_API_KEY>`; normal gateway keys are not enough,
-even if public gateway access is enabled.
+If Kelivo disconnects, the gateway continues reading an already-started
+upstream generation without writing to the destroyed response. A completed or
+partial generated assistant can be archived with `delivery_status=unconfirmed`;
+this does not claim that the client saw it. Normal delivery is `unknown` rather
+than assumed read. Archive write errors remain fail-open and cannot delay
+tokens.
 
-Rows are ordered by `(sequence, id)` ascending, so equal/null historical times
-stay stable. The HMAC cursor binds the requested filter and last key; later
-inserts cannot duplicate or skip earlier pages. The database is UTC. A business
-date converts local midnight and next local midnight separately with existing
-`TIME_ZONE`/`resolveTimeZone()` behavior, then queries the resulting UTC range.
-Strict calendar validation and independent endpoints protect midnight and DST
-transitions without assuming UTC, UTC+8, or Asia/Shanghai.
+## Content, privacy, and multimodal safety
+
+String content remains text. Multipart content uses the existing
+`normalizeContentToText()` and a structural traversal for `content_json`.
+`data:image/...;base64` is immediately replaced by placeholder, MIME type,
+byte estimate, and SHA-256; the raw base64 is neither JSON-stringified for the
+archive nor persisted. Normal URLs, text, and descriptions remain. Sanitization
+is archive-only and the upstream receives the original payload unchanged.
+
+Archive logs contain event/kind/count/state/error category only. They never
+contain chat content, prompts, keys, URLs, authorization values, DB URL, or
+base64.
+
+## Migrations and fault isolation
+
+Archive activates only when `ARCHIVE_ENABLED=true` and
+`ARCHIVE_DATABASE_URL` is non-empty. The pool has connection/query/statement
+timeouts. Each migration transaction first takes the fixed project-specific
+`pg_advisory_xact_lock` key, then checks applied migrations, runs pending SQL,
+records each file, and commits. The lock is released automatically at commit or
+rollback, so concurrent Railway instances serialize migration work.
+
+Migration failure rolls back and schedules `archive_migration_failed` plus the
+normal content-free Archive error. The Gateway continues chat, stream,
+Heartbeat, Bark, and proactive sync. Rollback is disabling Archive and
+restarting; it is non-destructive. Future deployed changes are additive,
+versioned migrations. V1A has not been deployed, so `001_initial.sql` is the
+correct initial schema.
+
+## Read API and business dates
+
+`GET /v1/archive/messages` and `/v1/archive/stats` require the independent
+`ARCHIVE_API_KEY` Bearer token. They validate `conversation_id`, strict date,
+bounded limit, `include_duplicates`, and a signed keyset cursor. SQL is
+parameterized. Ordering is `(sequence, id)`; totals are conversation-scoped.
+
+All stored instants are UTC. `date=YYYY-MM-DD` means `[local start of day,
+next local start of day)` in configured `TIME_ZONE`. `@js-temporal/polyfill`
+resolves each IANA local midnight independently with `disambiguation: 'reject'`:
+23/24/25-hour DST days work, while skipped or repeated local midnights/dates
+are rejected rather than silently shifted into an adjacent business date.
 
 ## V1B and Ombre Brain boundary
 
-V1B will import old Kelivo data with `kelivo_history_import`, historical
-timestamps where known, and importer provenance. It will align runs by
-conversation, ordered role/content, known timestamp tolerance, and neighbors;
-proven overlaps upgrade/reconcile provenance and unproven candidates become
-conflicts rather than being hash-deleted. Thus V1B can safely overlap V1A's
-start date. Ombre Brain will only page raw facts by conversation/date/range and
-write its semantic output elsewhere. It must never summarize, replace, or
-coerce `archive_messages`.
-
-## Risk review
-
-* Rolling 40 rows: one-time seed plus ordered tail/window reconciliation stops
-  repeated insertion.
-* Repeated `嗯`: predecessor sequence and turn identity preserve both facts.
-* Stream loss: SSE collector writes only after normal completion; failure is
-  isolated and visible as a safe archive error.
-* HTTP retry: bounded exact turn lookup prevents common replay duplication;
-  unavoidable no-client-ID ambiguity is conflict-audited.
-* Windows/iPhone: both use conversation-tail reconciliation, not device state.
-* DB outage: background timeout-bounded errors never escape the primary path.
-* Proactive duplicate: unique external event ID blocks it.
-* Date shift: configured-zone local midnight endpoints become UTC bounds.
-* V1B overlap: ordered contextual reconciliation avoids blind duplicates or
-  silent loss.
+V1B may import old Kelivo history as `kelivo_history_import`. It must preserve
+provenance and use ordered neighbours/timestamps for evidence; overlap that is
+not proven remains a conflict candidate, never a hash delete. Ombre Brain may
+page Raw Archive by conversation/date/range and write semantic memory elsewhere.
+It must not change raw archive facts.
