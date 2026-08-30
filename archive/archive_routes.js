@@ -72,6 +72,7 @@ function registerArchiveRoutes(app, { archiveService, timeZone, archiveApiKey = 
         total: stats.total,
         user_count: stats.user_count,
         assistant_count: stats.assistant_count,
+        unresolved_identity_conflicts: stats.unresolved_identity_conflicts,
         messages: page.messages.map(message => ({
           archive_message_id: message.archive_message_id,
           role: message.role,

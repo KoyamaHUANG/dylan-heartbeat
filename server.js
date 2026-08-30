@@ -20,7 +20,8 @@ const {
 const { authorizeArchiveRequest } = require("./archive/archive_auth");
 const { SseAssistantCollector } = require("./archive/archive_stream");
 const { registerArchiveRoutes } = require("./archive/archive_routes");
-const { RawChatArchiveService, buildChatCaptureInput, extractClientRequestId } = require("./archive/archive_sync");
+const { RawChatArchiveService, buildChatCaptureInput } = require("./archive/archive_sync");
+const { validateArchiveIdentity } = require("./archive/archive_protocol");
 const {
   loadKelivoSyncContext,
   parseKelivoSyncHeaders,
@@ -111,6 +112,7 @@ function extractAssistantArchivePayload(responseText, contentType) {
     content: hasContent ? message.content : "",
     completion_status: "complete",
     confirmed: true,
+    intermediate: !hasContent && Object.prototype.hasOwnProperty.call(structured, "tool_calls"),
     metadata_json: Object.keys(structured).length > 0 ? { structured_assistant: structured } : {}
   };
 }
@@ -699,7 +701,11 @@ app.addHook("onClose", async () => {
 app.get("/v1/proactive-events", async (req, reply) => {
   try {
     const result = listProactiveEvents(req.query || {});
-    reply.send({ object: "proactive_event_list", ...result });
+    reply.send({
+      object: "proactive_event_list",
+      ...result,
+      capabilities: { archive_identity_protocol: 1 }
+    });
   } catch (error) {
     if (isInputValidationError(error)) {
       return reply.code(400).send({ error: "Invalid proactive events query" });
@@ -769,15 +775,14 @@ app.post("/v1/chat/completions", async (req, reply) => {
     tsDBDirty = rememberLatestUserReceiveTime(kelivoMessages, tsDB, requestReceivedAt) || tsDBDirty;
     if (tsDBDirty) saveTimestampDB(tsDB);
 
-    // Archive is an independent, fail-open observer. It never changes the rolling timeline or upstream payload.
+    // Archive is an independent, fail-open observer. Protocol 1 is the only
+    // route to a canonical user message; role/content heuristics are never an
+    // archive identity source.
+    const archiveProtocol = validateArchiveIdentity({ headers: req.headers, body });
     const archiveCapture = rawChatArchive.captureChatRequest(buildChatCaptureInput({
-      binding: kelivoSyncBinding,
-      messages: kelivoMessages,
-      timestampDb: tsDB,
-      timeZone: TIME_ZONE,
-      observedAt: requestReceivedAt,
-      clientRequestId: extractClientRequestId(req.headers)
-    }));
+      archiveIdentity: archiveProtocol.identity,
+      observedAt: requestReceivedAt
+    }), { skipReason: archiveProtocol.reason || "archive_identity_invalid" });
 
     // 缺失 Header 的旧 Kelivo 保持完全兼容；只有真实 user 回合才更新持久化绑定。
     updateKelivoSyncContextFromChat(kelivoSyncBinding, kelivoMessages);
@@ -885,7 +890,11 @@ app.post("/v1/chat/completions", async (req, reply) => {
         "Content-Type": "application/json",
         Authorization: `Bearer ${process.env.TARGET_API_KEY}`
       },
-      body: JSON.stringify({ ...body, messages: upstreamMessages })
+      body: JSON.stringify((() => {
+        const upstreamBody = { ...body, messages: upstreamMessages };
+        delete upstreamBody._kelivo_archive;
+        return upstreamBody;
+      })())
     });
 
     const upstreamContentType = response.headers.get("content-type") || "";
@@ -951,11 +960,16 @@ app.post("/v1/chat/completions", async (req, reply) => {
       archiveStreamCollector.finish();
       const outcome = archiveStreamCollector.archiveOutcome({ upstreamReadError: Boolean(upstreamReadError), clientDisconnected });
       if (outcome.has_payload) {
+        const intermediateToolPhase = !String(outcome.content || "").trim() &&
+          Array.isArray(outcome.structured_deltas) &&
+          outcome.structured_deltas.some(delta => delta && typeof delta === "object" &&
+            (Array.isArray(delta.tool_calls) || delta.function_call != null));
         archiveCapture.archiveAssistant({
           content: outcome.content,
           completion_status: outcome.completion_status,
           confirmed: outcome.confirmed,
           delivery_status: outcome.delivery_status,
+          intermediate: intermediateToolPhase,
           metadata_json: {
             termination_reason: outcome.termination_reason,
             structured_stream_deltas: outcome.structured_deltas

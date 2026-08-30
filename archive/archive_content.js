@@ -29,7 +29,12 @@ function sanitizeArchiveJson(value) {
 
 function archiveContent(content) {
   return {
-    content_text: normalizeContentToText(content),
+    content_text: content && typeof content === "object" && Array.isArray(content.parts)
+      ? content.parts
+        .filter(part => part && typeof part === "object" && part.type === "text")
+        .map(part => String(part.text || ""))
+        .join("")
+      : normalizeContentToText(content),
     content_json: sanitizeArchiveJson(content)
   };
 }

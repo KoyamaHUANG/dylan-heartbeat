@@ -26,6 +26,7 @@ const { app, rawChatArchive } = require("../server");
 
 const db = newDb();
 db.public.none(fs.readFileSync(path.join(__dirname, "..", "migrations", "001_initial.sql"), "utf8"));
+db.public.none(fs.readFileSync(path.join(__dirname, "..", "migrations", "002_kelivo_archive_identity.sql"), "utf8"));
 const { Pool } = db.adapters.createPg();
 const archiveStore = new ArchiveStore({ pool: new Pool() });
 archiveStore.migrated = true;
@@ -37,6 +38,13 @@ global.fetch = async (url, options = {}) => {
   if (upstreamOverride) return upstreamOverride(url, options);
   assert.equal(String(url), upstreamUrl);
   const request = JSON.parse(options.body);
+  assert.equal(Object.prototype.hasOwnProperty.call(request, "_kelivo_archive"), false);
+  for (const key of Object.keys(options.headers || {})) {
+    assert.equal(key.toLowerCase().startsWith("x-kelivo-archive-"), false);
+    assert.notEqual(key.toLowerCase(), "x-kelivo-request-id");
+    assert.notEqual(key.toLowerCase(), "x-kelivo-user-message-id");
+    assert.notEqual(key.toLowerCase(), "x-kelivo-parent-request-id");
+  }
   if (request.stream) {
     return new Response(
       "data: {\"choices\":[{\"delta\":{\"content\":\"流式\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"回复\"}}]}\n\ndata: [DONE]\n\n",
@@ -53,16 +61,69 @@ function publicHeaders(extra = {}) {
   return { authorization: `Bearer ${gatewayKey}`, ...extra };
 }
 
-async function chat(messages, { stream = false } = {}) {
+let identitySerial = 0;
+
+async function chat(messages, { stream = false, requestId, userMessageId, userMessageIndex } = {}) {
+  const index = userMessageIndex ?? messages.map(message => message.role).lastIndexOf("user");
+  const user = messages[index];
+  const serial = ++identitySerial;
+  const resolvedRequestId = requestId || `request-${serial}`;
+  const resolvedUserMessageId = userMessageId || `message-${serial}`;
   return app.inject({
     method: "POST",
     url: "/v1/chat/completions",
     remoteAddress: "10.0.0.8",
     headers: publicHeaders({
       "x-kelivo-conversation-id": "conversation-A",
-      "x-kelivo-assistant-id": "ayan"
+      "x-kelivo-assistant-id": "ayan",
+      "x-kelivo-archive-protocol": "1",
+      "x-kelivo-request-id": resolvedRequestId,
+      "x-kelivo-user-message-id": resolvedUserMessageId
     }),
-    payload: { model: "test-model", stream, messages }
+    payload: {
+      model: "test-model", stream, messages,
+      _kelivo_archive: {
+        version: 1,
+        kind: "user_send",
+        conversation_id: "conversation-A",
+        assistant_id: "ayan",
+        request_id: resolvedRequestId,
+        user_message_id: resolvedUserMessageId,
+        user_message_index: index,
+        user_message_time: "2026-08-30T15:08:03.000Z",
+        user_archive_content: {
+          format: "kelivo_chat_message_parts_v1",
+          parts: [{ type: "text", text: user?.content || "" }]
+        }
+      }
+    }
+  });
+}
+
+async function continuation(requestId, messages) {
+  return app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    remoteAddress: "10.0.0.8",
+    headers: publicHeaders({
+      "x-kelivo-conversation-id": "conversation-A",
+      "x-kelivo-assistant-id": "ayan",
+      "x-kelivo-archive-protocol": "1",
+      "x-kelivo-request-id": requestId,
+      "x-kelivo-parent-request-id": requestId
+    }),
+    payload: {
+      model: "test-model",
+      messages,
+      _kelivo_archive: {
+        version: 1,
+        kind: "continuation",
+        conversation_id: "conversation-A",
+        assistant_id: "ayan",
+        request_id: requestId,
+        parent_request_id: requestId
+      }
+    }
   });
 }
 
@@ -176,19 +237,32 @@ test("Gateway archives EOF-without-DONE and upstream reader errors as explicit p
   }
 });
 
-test("Gateway archives tool-call-only assistant structure without inventing text", async () => {
+test("Gateway stores tool-call-only assistants as a non-canonical phase and preserves the final slot", async () => {
   try {
     upstreamOverride = async () => new Response(JSON.stringify({
       choices: [{ message: { role: "assistant", tool_calls: [{ id: "call_archive", type: "function", function: { name: "lookup", arguments: "{}" } }] } }]
     }), { status: 200, headers: { "content-type": "application/json" } });
-    const response = await chat([{ role: "user", content: "结构化请求" }]);
+    const response = await chat([{ role: "user", content: "结构化请求" }], { requestId: "tool-root", userMessageId: "tool-user" });
     assert.equal(response.statusCode, 200);
     await rawChatArchive.flush();
-    const row = (await rawChatArchive.store.pool.query(
-      "SELECT content_text, metadata_json FROM archive_messages WHERE source = 'gateway_assistant' ORDER BY sequence DESC LIMIT 1"
+    upstreamOverride = null;
+    const followUp = await continuation("tool-root", [
+      { role: "user", content: "结构化请求" },
+      { role: "assistant", content: "", tool_calls: [{ id: "call_archive", type: "function", function: { name: "lookup", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_archive", content: "result" }
+    ]);
+    assert.equal(followUp.statusCode, 200);
+    await rawChatArchive.flush();
+    const phase = (await rawChatArchive.store.pool.query(
+      "SELECT content_text, canonical, metadata_json FROM archive_messages WHERE source = 'gateway_assistant_tool_phase' ORDER BY sequence DESC LIMIT 1"
     )).rows[0];
-    assert.equal(row.content_text, "");
-    assert.match(JSON.stringify(row.metadata_json), /call_archive/);
+    assert.equal(phase.content_text, "");
+    assert.equal(phase.canonical, false);
+    assert.match(JSON.stringify(phase.metadata_json), /call_archive/);
+    const canonical = (await rawChatArchive.store.pool.query(
+      "SELECT content_text FROM archive_messages WHERE source = 'gateway_assistant' ORDER BY sequence DESC LIMIT 1"
+    )).rows[0];
+    assert.equal(canonical.content_text, "正常回复");
   } finally {
     upstreamOverride = null;
   }

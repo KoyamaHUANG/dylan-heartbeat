@@ -317,19 +317,20 @@ class ArchiveStore {
     );
   }
 
-  async _findDeterministicRetry(client, conversationId, clientRequestId) {
+  async _findByClientRequestId(client, conversationId, clientRequestId) {
     if (!clientRequestId) return null;
     const result = await client.query(
-      "SELECT turn_id, status, assistant_archive_message_id FROM archive_turns WHERE conversation_id = $1 AND client_request_id = $2",
+      "SELECT turn_id, status, assistant_archive_message_id, client_request_id, client_user_message_id FROM archive_turns WHERE conversation_id = $1 AND client_request_id = $2 ORDER BY started_at DESC LIMIT 1",
       [conversationId, clientRequestId]
     );
     return result.rows[0] || null;
   }
 
-  async _findPossibleRetry(client, conversationId, requestContextHash) {
+  async _findByClientUserMessageId(client, conversationId, clientUserMessageId) {
+    if (!clientUserMessageId) return null;
     const result = await client.query(
-      "SELECT turn_id FROM archive_turns WHERE conversation_id = $1 AND request_context_hash = $2 AND canonical = TRUE ORDER BY started_at DESC LIMIT 1",
-      [conversationId, requestContextHash]
+      "SELECT turn_id, status, assistant_archive_message_id, client_request_id, client_user_message_id FROM archive_turns WHERE conversation_id = $1 AND client_user_message_id = $2 ORDER BY started_at DESC LIMIT 1",
+      [conversationId, clientUserMessageId]
     );
     return result.rows[0] || null;
   }
@@ -338,91 +339,61 @@ class ArchiveStore {
     await this.migrate();
     const conversationId = normalizeIdentifier(input.conversation_id, { field: "conversation_id", required: true });
     const assistantId = normalizeIdentifier(input.assistant_id, { field: "assistant_id" });
-    const clientRequestId = normalizeIdentifier(input.client_request_id, { field: "client_request_id" });
+    const clientRequestId = normalizeIdentifier(input.client_request_id, { field: "client_request_id", required: true });
+    const clientUserMessageId = normalizeIdentifier(input.client_user_message_id, { field: "client_user_message_id", required: true });
+    const protocolVersion = Number(input.archive_protocol_version);
+    if (protocolVersion !== 1 || input.identity_status !== "verified") {
+      throw archiveError("ARCHIVE_VALIDATION", "protocol identity is invalid");
+    }
+    const rootRequestId = normalizeIdentifier(input.root_request_id, { field: "root_request_id", required: true });
+    if (rootRequestId !== clientRequestId) throw archiveError("ARCHIVE_VALIDATION", "root_request_id must equal client_request_id");
+    const clientUserMessageTime = asIso(input.client_user_message_time);
     const observedAt = asIso(input.observed_at || this.now());
     const latestUser = input.latest_user;
     if (!latestUser || latestUser.role !== "user") throw archiveError("ARCHIVE_VALIDATION", "latest_user is invalid");
     const requestContextHash = String(input.request_context_hash || "");
     if (!/^[0-9a-f]{64}$/i.test(requestContextHash)) throw archiveError("ARCHIVE_VALIDATION", "request_context_hash is invalid");
-    const visible = Array.isArray(input.visible_context) ? input.visible_context : [];
 
     return this._transaction(async client => {
       await this._lockConversation(client, conversationId);
-      // A client supplied identity is the only deterministic retry proof.
-      const deterministicRetry = await this._findDeterministicRetry(client, conversationId, clientRequestId);
-      if (deterministicRetry) {
-        return { turn_id: deterministicRetry.turn_id, deduped: true, deterministic_retry: true, status: deterministicRetry.status };
+      const byRequest = await this._findByClientRequestId(client, conversationId, clientRequestId);
+      const byMessage = await this._findByClientUserMessageId(client, conversationId, clientUserMessageId);
+      if (byRequest && byMessage && byRequest.turn_id === byMessage.turn_id) {
+        return { turn_id: byRequest.turn_id, deduped: true, deterministic_retry: true, status: byRequest.status };
       }
-
-      let tail = await this._tail(client, conversationId);
-      const hasConversation = tail.length > 0;
-      let reconcileStatus = "direct";
-      let overlap = { kind: "NONE", size: 0 };
-      let pendingConflict = null;
-
-      if (!hasConversation) {
-        for (const message of visible) {
-          await this._insertMessage(client, {
-            conversation_id: conversationId,
-            assistant_id: assistantId,
-            role: message.role,
-            content: message.content,
-            source: "initial_context_seed",
-            message_time: message.message_time,
-            observed_at: observedAt,
-            confirmed: true,
-            reconcile_status: "seeded",
-            metadata_json: { message_time_known: Boolean(message.message_time) }
-          });
-        }
-        tail = await this._tail(client, conversationId);
-      } else if (visible.length > 0) {
-        overlap = resolveRollingOverlap(tail, visible.map(messageIdentity));
-        if (overlap.kind === "RELIABLE") {
-          for (const message of visible.slice(overlap.size)) {
-            await this._insertMessage(client, {
-              conversation_id: conversationId,
-              assistant_id: assistantId,
-              role: message.role,
-              content: message.content,
-              source: "reconciled_context",
-              message_time: message.message_time,
-              observed_at: observedAt,
-              confirmed: true,
-              reconcile_status: "reconciled",
-              metadata_json: { message_time_known: Boolean(message.message_time), overlap_size: overlap.size }
-            });
+      if (byRequest || byMessage) {
+        const related = byRequest || byMessage;
+        const reason = byRequest
+          ? "request_id_reused_with_different_user_message_id"
+          : "user_message_id_reused_with_different_request_id";
+        await this._recordConflict(client, {
+          conversationId,
+          requestContextHash,
+          reason,
+          observedAt,
+          relatedTurnId: related.turn_id,
+          metadata: {
+            incoming_identity: { client_request_id: clientRequestId, client_user_message_id: clientUserMessageId },
+            existing_identity: {
+              client_request_id: related.client_request_id,
+              client_user_message_id: related.client_user_message_id
+            }
           }
-          tail = await this._tail(client, conversationId);
-        } else if (overlap.kind === "AMBIGUOUS") {
-          reconcileStatus = "ambiguous_overlap";
-          pendingConflict = {
-            reason: "rolling_context_ambiguous_overlap",
-            metadata: { visible_count: visible.length, archived_tail_count: tail.length, overlap }
-          };
-        } else if (!identityEquals(tail.at(-1), messageIdentity(visible.at(-1)))) {
-          reconcileStatus = "conflict";
-          pendingConflict = {
-            reason: "rolling_context_no_reliable_overlap",
-            metadata: { visible_count: visible.length, archived_tail_count: tail.length }
-          };
-        }
+        });
+        return { skipped: true, event: "archive_identity_conflict", reason };
       }
 
-      // Similar payloads without a stable request identity stay in history as
-      // possible candidates. They are never reused or physically removed here.
-      const possibleRetry = clientRequestId ? null : await this._findPossibleRetry(client, conversationId, requestContextHash);
-      if (possibleRetry) reconcileStatus = "possible_retry";
-
+      const tail = await this._tail(client, conversationId);
       const predecessorSequence = tail.at(-1)?.sequence || 0;
       const turnKey = requestKey({ conversationId, assistantId, predecessorSequence, requestContextHash });
       const turnId = crypto.randomUUID();
       await client.query(
         `INSERT INTO archive_turns (
-          turn_id, conversation_id, assistant_id, client_request_id, request_key,
-          request_context_hash, predecessor_sequence, status, canonical, started_at, metadata_json
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'awaiting_assistant', TRUE, $8, $9::jsonb)`,
-        [turnId, conversationId, assistantId, clientRequestId, turnKey, requestContextHash, predecessorSequence || null, observedAt, JSON.stringify({})]
+          turn_id, conversation_id, assistant_id, client_request_id, client_user_message_id,
+          archive_protocol_version, identity_status, root_request_id, client_user_message_time,
+          request_key, request_context_hash, predecessor_sequence, status, canonical, started_at, metadata_json
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'awaiting_assistant', TRUE, $13, $14::jsonb)`,
+        [turnId, conversationId, assistantId, clientRequestId, clientUserMessageId, protocolVersion, "verified", rootRequestId, clientUserMessageTime, turnKey, requestContextHash, predecessorSequence || null, observedAt, JSON.stringify({})]
       );
       const user = await this._insertMessage(client, {
         conversation_id: conversationId,
@@ -431,46 +402,80 @@ class ArchiveStore {
         role: "user",
         content: latestUser.content,
         source: "kelivo_live_user",
-        message_time: latestUser.message_time || observedAt,
+        message_time: clientUserMessageTime,
         observed_at: observedAt,
         confirmed: true,
-        reconcile_status: reconcileStatus,
+        reconcile_status: "direct",
         turn_key: turnKey,
         metadata_json: {
-          message_time_known: true,
+          archive_protocol_version: protocolVersion,
+          identity_status: "verified",
           client_request_id_present: Boolean(clientRequestId),
-          overlap_kind: overlap.kind
+          client_user_message_id: clientUserMessageId
         }
       });
       await client.query("UPDATE archive_turns SET user_archive_message_id = $1 WHERE turn_id = $2", [user.archive_message_id, turnId]);
 
-      if (possibleRetry) {
-        await this._recordConflict(client, {
-          conversationId,
-          requestContextHash,
-          reason: "possible_transport_retry_unproven",
-          observedAt,
-          candidateTurnId: turnId,
-          relatedTurnId: possibleRetry.turn_id,
-          metadata: { predecessor_sequence: predecessorSequence || null }
-        });
-      }
-      if (pendingConflict) {
-        await this._recordConflict(client, {
-          conversationId,
-          requestContextHash,
-          reason: pendingConflict.reason,
-          observedAt,
-          candidateTurnId: turnId,
-          metadata: pendingConflict.metadata
-        });
-      }
       return { turn_id: turnId, user_archive_message_id: user.archive_message_id, deduped: false, status: "awaiting_assistant" };
+    });
+  }
+
+  async captureContinuation(input) {
+    await this.migrate();
+    const conversationId = normalizeIdentifier(input.conversation_id, { field: "conversation_id", required: true });
+    const rootRequestId = normalizeIdentifier(input.root_request_id, { field: "root_request_id", required: true });
+    const requestId = normalizeIdentifier(input.client_request_id, { field: "client_request_id", required: true });
+    const observedAt = asIso(input.observed_at || this.now());
+    if (Number(input.archive_protocol_version) !== 1 || rootRequestId !== requestId) {
+      throw archiveError("ARCHIVE_VALIDATION", "continuation identity is invalid");
+    }
+    return this._transaction(async client => {
+      await this._lockConversation(client, conversationId);
+      const turn = await this._findByClientRequestId(client, conversationId, rootRequestId);
+      if (turn?.client_user_message_id) return { turn_id: turn.turn_id, deduped: true, status: turn.status };
+      await this._recordConflict(client, {
+        conversationId,
+        requestContextHash: sha256(`continuation:${rootRequestId}`),
+        reason: "continuation_root_turn_not_found",
+        observedAt,
+        metadata: { incoming_identity: { root_request_id: rootRequestId } }
+      });
+      return { skipped: true, event: "archive_identity_conflict", reason: "continuation_root_turn_not_found" };
     });
   }
 
   async captureAssistantForTurn(input) {
     return this._runForTurn(String(input?.turn_id || ""), () => this._captureAssistantForTurnLocked(input));
+  }
+
+  async captureAssistantPhaseForTurn({ turn_id, content, content_text, content_json, observed_at, metadata_json = {} }) {
+    await this.migrate();
+    const observedAt = asIso(observed_at || this.now());
+    return this._transaction(async client => {
+      const turnResult = await client.query("SELECT * FROM archive_turns WHERE turn_id = $1 FOR UPDATE", [turn_id]);
+      const turn = turnResult.rows[0];
+      if (!turn) throw archiveError("ARCHIVE_TURN_NOT_FOUND", "archive turn was not found");
+      const phase = await this._insertMessage(client, {
+        conversation_id: turn.conversation_id,
+        assistant_id: turn.assistant_id,
+        turn_id,
+        role: "assistant",
+        content,
+        content_text,
+        content_json,
+        source: "gateway_assistant_tool_phase",
+        message_time: observedAt,
+        observed_at: observedAt,
+        canonical: false,
+        confirmed: true,
+        completion_status: "complete",
+        delivery_status: "unknown",
+        reconcile_status: "direct",
+        turn_key: turn.request_key,
+        metadata_json
+      });
+      return { turn_id, archive_message_id: phase.archive_message_id, phase: true, deduped: false };
+    });
   }
 
   async _captureAssistantForTurnLocked({
@@ -635,6 +640,10 @@ class ArchiveStore {
       args
     );
     const hasMore = rows.rows.length > limit;
+    const unresolved = await this.pool.query(
+      "SELECT COUNT(*)::bigint AS total FROM archive_reconciliation_conflicts WHERE conversation_id = $1 AND status = 'open'",
+      [conversationId]
+    );
     const page = rows.rows.slice(0, limit).map(row => ({
       ...row,
       id: Number(row.id),
@@ -643,7 +652,13 @@ class ArchiveStore {
       message_time: row.message_time ? new Date(row.message_time).toISOString() : null,
       observed_at: new Date(row.observed_at).toISOString()
     }));
-    return { conversation_id: conversationId, date: date || null, messages: page, has_more: hasMore };
+    return {
+      conversation_id: conversationId,
+      date: date || null,
+      messages: page,
+      has_more: hasMore,
+      unresolved_identity_conflicts: Number(unresolved.rows[0]?.total || 0)
+    };
   }
 
   async stats({ conversation_id, dateRange, include_duplicates = false }) {
@@ -666,13 +681,18 @@ class ArchiveStore {
       args
     );
     const row = result.rows[0];
+    const unresolved = await this.pool.query(
+      "SELECT COUNT(*)::bigint AS total FROM archive_reconciliation_conflicts WHERE conversation_id = $1 AND status = 'open'",
+      [conversationId]
+    );
     return {
       conversation_id: conversationId,
       total: Number(row.total || 0),
       user_count: Number(row.user_count || 0),
       assistant_count: Number(row.assistant_count || 0),
       first_message_time: row.first_message_time ? new Date(row.first_message_time).toISOString() : null,
-      last_message_time: row.last_message_time ? new Date(row.last_message_time).toISOString() : null
+      last_message_time: row.last_message_time ? new Date(row.last_message_time).toISOString() : null,
+      unresolved_identity_conflicts: Number(unresolved.rows[0]?.total || 0)
     };
   }
 }

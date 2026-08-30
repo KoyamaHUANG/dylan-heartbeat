@@ -1,12 +1,5 @@
 const { ArchiveStore, archiveError, sha256 } = require("./archive_store");
-const { messageIdentity } = require("./archive_content");
-const {
-  normalizeContentToText,
-  parseTimestampLabel,
-  getTimestampFromMemory,
-  isRealUserMessageForTimeline
-} = require("../timestamp_memory");
-const { isSpecialEventContent } = require("../special_events");
+const { stableJson } = require("./archive_content");
 
 function readBoolean(value) {
   return ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
@@ -42,47 +35,42 @@ function extractClientRequestId(headers = {}) {
   );
 }
 
-function isArchiveChatMessage(message) {
-  if (!message || message.tool_calls) return false;
-  if (message.role === "user") return isRealUserMessageForTimeline(message);
-  if (message.role !== "assistant") return false;
-  return !isSpecialEventContent(normalizeContentToText(message.content));
-}
-
-function knownMessageTime(message, timestampDb, timeZone) {
-  const fromContent = parseTimestampLabel(normalizeContentToText(message?.content), timeZone);
-  if (fromContent) return fromContent.toISOString();
-  const fromMemory = getTimestampFromMemory(message, timestampDb);
-  return fromMemory ? fromMemory.toISOString() : null;
-}
-
-function buildChatCaptureInput({ binding, messages, timestampDb = {}, timeZone, observedAt = new Date(), clientRequestId = null }) {
-  if (!binding?.provided || !binding.conversation_id) return null;
-  const eligible = (Array.isArray(messages) ? messages : []).filter(isArchiveChatMessage);
-  if (eligible.at(-1)?.role !== "user") return null;
-  const latest = eligible.at(-1);
-  const visible = eligible.slice(0, -1).map(message => ({
-    role: message.role,
-    content: message.content,
-    message_time: knownMessageTime(message, timestampDb, timeZone)
-  }));
+function buildChatCaptureInput({ archiveIdentity, observedAt = new Date() }) {
+  if (!archiveIdentity) return null;
+  if (archiveIdentity.kind === "continuation") {
+    return {
+      kind: "continuation",
+      conversation_id: archiveIdentity.conversation_id,
+      assistant_id: archiveIdentity.assistant_id || null,
+      client_request_id: archiveIdentity.request_id,
+      root_request_id: archiveIdentity.root_request_id,
+      archive_protocol_version: archiveIdentity.version,
+      observed_at: new Date(observedAt).toISOString()
+    };
+  }
+  if (archiveIdentity.kind !== "user_send") return null;
   const request_context_hash = sha256(stableStringify({
-    version: 1,
-    conversation_id: binding.conversation_id,
-    assistant_id: binding.assistant_id || null,
-    client_request_id: normalizeClientRequestId(clientRequestId),
-    messages: eligible.map(messageIdentity)
+    version: 2,
+    conversation_id: archiveIdentity.conversation_id,
+    assistant_id: archiveIdentity.assistant_id || null,
+    request_id: archiveIdentity.request_id,
+    user_message_id: archiveIdentity.user_message_id,
+    user_archive_content: stableJson(archiveIdentity.user_archive_content)
   }));
   return {
-    conversation_id: binding.conversation_id,
-    assistant_id: binding.assistant_id || null,
-    client_request_id: normalizeClientRequestId(clientRequestId),
+    conversation_id: archiveIdentity.conversation_id,
+    assistant_id: archiveIdentity.assistant_id || null,
+    client_request_id: archiveIdentity.request_id,
+    client_user_message_id: archiveIdentity.user_message_id,
+    archive_protocol_version: archiveIdentity.version,
+    identity_status: "verified",
+    root_request_id: archiveIdentity.root_request_id,
+    client_user_message_time: archiveIdentity.user_message_time,
     observed_at: new Date(observedAt).toISOString(),
-    visible_context: visible,
     latest_user: {
       role: "user",
-      content: latest.content,
-      message_time: knownMessageTime(latest, timestampDb, timeZone) || new Date(observedAt).toISOString()
+      content: archiveIdentity.user_archive_content,
+      message_time: archiveIdentity.user_message_time
     },
     request_context_hash
   };
@@ -96,10 +84,17 @@ function errorCategory(error) {
 }
 
 class ArchiveChatCapture {
-  constructor(service, input) {
+  constructor(service, input, { continuation = false } = {}) {
     this.service = service;
     this.input = input;
-    this.turnResult = service.schedule("incoming_turn", () => service.runForConversation(input.conversation_id, () => service._captureIncoming(input)));
+    this.continuation = continuation;
+    this.turnResult = service.schedule(
+      continuation ? "incoming_continuation" : "incoming_turn",
+      () => service.runForConversation(
+        input.conversation_id,
+        () => continuation ? service._captureContinuation(input) : service._captureIncoming(input)
+      )
+    );
   }
 
   archiveAssistant(payload, { observedAt = new Date(), metadata = {} } = {}) {
@@ -107,9 +102,15 @@ class ArchiveChatCapture {
       ? payload
       : { content: payload };
     return this.service.schedule("assistant", async () => {
-      let turn = await this.turnResult;
-      if (!turn?.turn_id) turn = await this.service.runForConversation(this.input.conversation_id, () => this.service._captureIncoming(this.input));
+      const turn = await this.turnResult;
       if (!turn?.turn_id) return { skipped: true };
+      if (assistant.intermediate === true) {
+        return this.service._captureAssistantPhase(turn.turn_id, {
+          ...assistant,
+          observed_at: observedAt,
+          metadata_json: { ...(assistant.metadata_json || {}), ...metadata }
+        });
+      }
       return this.service._captureAssistant(turn.turn_id, {
         ...assistant,
         observed_at: observedAt,
@@ -120,8 +121,7 @@ class ArchiveChatCapture {
 
   archiveAssistantTerminal({ observedAt = new Date(), status, metadata = {} } = {}) {
     return this.service.schedule("assistant_terminal", async () => {
-      let turn = await this.turnResult;
-      if (!turn?.turn_id) turn = await this.service.runForConversation(this.input.conversation_id, () => this.service._captureIncoming(this.input));
+      const turn = await this.turnResult;
       if (!turn?.turn_id) return { skipped: true };
       return this.service._markAssistantTerminal(turn.turn_id, { observed_at: observedAt, status, metadata_json: metadata });
     });
@@ -205,11 +205,17 @@ class RawChatArchiveService {
     return store.markAssistantTerminal({ turn_id: turnId, ...input });
   }
 
+  async _captureAssistantPhase(turnId, input) {
+    const store = await this._ensureStore();
+    return store.captureAssistantPhaseForTurn({ turn_id: turnId, ...input });
+  }
+
   schedule(kind, operation) {
     if (!this.enabled) return Promise.resolve(this._disabled());
     const task = Promise.resolve()
       .then(operation)
       .then(result => {
+        if (result?.event) this._safeLog(result.event === "archive_identity_conflict" ? "warn" : "log", { event: result.event, reason: result.reason });
         if (!result?.skipped) this._safeLog("log", { event: "archive_write_success", kind, deduped: Boolean(result?.deduped) });
         return result;
       })
@@ -236,9 +242,9 @@ class RawChatArchiveService {
     return current;
   }
 
-  captureChatRequest(input) {
+  captureChatRequest(input, { skipReason = "missing_archive_identity" } = {}) {
     if (!input) {
-      this._safeLog("log", { event: "archive_chat_skipped", reason: "missing_bound_final_user_turn" });
+      this._safeLog("log", { event: "archive_chat_skipped", reason: skipReason });
       return {
         archiveAssistant: () => Promise.resolve({ skipped: true }),
         archiveAssistantTerminal: () => Promise.resolve({ skipped: true })
@@ -251,7 +257,15 @@ class RawChatArchiveService {
         archiveAssistantTerminal: () => Promise.resolve({ skipped: true })
       };
     }
+    if (input.kind === "continuation") {
+      return new ArchiveChatCapture(this, input, { continuation: true });
+    }
     return new ArchiveChatCapture(this, input);
+  }
+
+  async _captureContinuation(input) {
+    const store = await this._ensureStore();
+    return store.captureContinuation(input);
   }
 
   captureProactive(input) {
@@ -287,7 +301,5 @@ module.exports = {
   buildChatCaptureInput,
   errorCategory,
   extractClientRequestId,
-  isArchiveChatMessage,
-  knownMessageTime,
   stableStringify
 };
