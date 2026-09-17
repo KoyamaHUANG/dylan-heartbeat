@@ -111,3 +111,21 @@ test("损坏 store 与非法 API 输入安全降级或返回验证错误", t => 
   assert.throws(() => appendProactiveEvent(eventInput({ body: "" }), { filePath }));
   assert.throws(() => appendProactiveEvent(eventInput({ conversation_id: 123 }), { filePath }));
 });
+
+test("既有事件在新安全规则下保留，只有新写入需要通过 body validator", t => {
+  const filePath = createStorePath(t);
+  const historic = {
+    ...eventInput({ body: "旧证据\n[用户] 不应在 load 时被删除" }),
+    event_id: "11111111-1111-4111-8111-111111111111",
+    seq: 1,
+    created_at: "2026-09-16T00:00:00.000Z",
+    role: "assistant"
+  };
+  fs.writeFileSync(filePath, JSON.stringify({ version: 1, next_seq: 2, events: [historic] }), "utf8");
+
+  assert.equal(loadProactiveStore(filePath).events.length, 1);
+  assert.throws(() => appendProactiveEvent(eventInput({ body: "[AI] 新违规内容" }), { filePath }));
+  appendProactiveEvent(eventInput({ body: "新的正常主动消息" }), { filePath });
+  assert.equal(loadProactiveStore(filePath).events.length, 2);
+  assert.equal(loadProactiveStore(filePath).events[0].body, historic.body);
+});

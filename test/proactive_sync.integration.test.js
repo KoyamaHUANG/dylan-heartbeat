@@ -33,7 +33,7 @@ process.env.PROACTIVE_SYNC_TEST_ENABLED = "false";
 const { app } = require("../server");
 const { runWakeUp, scheduleNextCheck } = require("../wake_up");
 const { makeFingerprint, makeFingerprintStripped } = require("../timestamp_memory");
-const { loadKelivoSyncContext } = require("../kelivo_sync_context");
+const { getConversationStatePaths, loadKelivoSyncContext } = require("../kelivo_sync_context");
 const { loadProactiveStore } = require("../proactive_events");
 const { isSpecialEventContent } = require("../special_events");
 
@@ -43,6 +43,11 @@ const barkPayloads = [];
 const wakeEventPayloads = [];
 const modelReplies = [];
 let barkShouldFail = false;
+const targetA = { conversation_id: "conversation-A", assistant_id: "ayan" };
+
+function structured(action, body = "", title = "") {
+  return JSON.stringify({ action, title, body });
+}
 
 function jsonResponse(status, body) {
   return new Response(JSON.stringify(body), {
@@ -68,12 +73,25 @@ function removeRuntimeFile(name) {
   fs.rmSync(path.join(dataDirectory, name), { force: true });
 }
 
-function setRememberedTime(message, date = Date.now() - 5 * 60 * 1000) {
-  const db = readJson("message_timestamps.json", {});
+function stateJson(binding, name, fallback) {
+  const state = getConversationStatePaths(binding);
+  const filePath = name === "timeline" ? state.timeline_file : state.timestamp_db_file;
+  return fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, "utf8")) : fallback;
+}
+
+function writeStateJson(binding, name, value) {
+  const state = getConversationStatePaths(binding);
+  fs.mkdirSync(state.directory, { recursive: true });
+  const filePath = name === "timeline" ? state.timeline_file : state.timestamp_db_file;
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf8");
+}
+
+function setRememberedTime(message, binding = targetA, date = Date.now() - 5 * 60 * 1000) {
+  const db = stateJson(binding, "timestamps", {});
   const iso = new Date(date).toISOString();
   db[makeFingerprint(message)] = iso;
   db[makeFingerprintStripped(message)] = iso;
-  writeJson("message_timestamps.json", db);
+  writeStateJson(binding, "timestamps", db);
 }
 
 function resetRuntimeState() {
@@ -81,8 +99,10 @@ function resetRuntimeState() {
     "enhanced_messages.json",
     "message_timestamps.json",
     "proactive_events.json",
-    "kelivo_sync_context.json"
+    "kelivo_sync_context.json",
+    "kelivo_sync_context_v2.json"
   ]) removeRuntimeFile(fileName);
+  fs.rmSync(path.join(dataDirectory, "conversation_state"), { recursive: true, force: true });
   fs.rmSync(path.join(dataDirectory, "diary"), { recursive: true, force: true });
 }
 
@@ -155,7 +175,7 @@ test("proactive API、conversation binding 与 wake-up 同步保持隔离且连�
     "x-kelivo-conversation-id": "conversation-A",
     "x-kelivo-assistant-id": "ayan"
   });
-  const boundContext = loadKelivoSyncContext();
+  const boundContext = loadKelivoSyncContext(targetA);
   assert.equal(boundContext.conversation_id, "conversation-A");
   assert.equal(boundContext.assistant_id, "ayan");
   assert.equal(boundContext.latest_user_fingerprint, makeFingerprint(user));
@@ -164,19 +184,21 @@ test("proactive API、conversation binding 与 wake-up 同步保持隔离且连�
   // H / I. 无 Header 兼容旧 Kelivo；assistant/tool/system 请求不能切换既有绑定。
   fs.writeFileSync(path.join(dataDirectory, "proactive_events.json"), "{bad store", "utf8");
   await chat([system, { role: "user", content: "旧 Kelivo 继续聊天" }]);
-  assert.equal(loadKelivoSyncContext().conversation_id, "conversation-A");
+  assert.equal(loadKelivoSyncContext(targetA).conversation_id, "conversation-A");
   await chat([system, { role: "assistant", content: "不是新用户回合" }], {
     "x-kelivo-conversation-id": "conversation-B",
     "x-kelivo-assistant-id": "other"
   });
-  assert.equal(loadKelivoSyncContext().conversation_id, "conversation-A");
+  assert.equal(loadKelivoSyncContext(targetA).conversation_id, "conversation-A");
   await chat([system, { role: "tool", tool_call_id: "tool-1", content: "工具结果" }], {
-    "x-kelivo-conversation-id": "conversation-B"
+    "x-kelivo-conversation-id": "conversation-B",
+    "x-kelivo-assistant-id": "other"
   });
   await chat([{ role: "system", content: "仅系统消息" }], {
-    "x-kelivo-conversation-id": "conversation-B"
+    "x-kelivo-conversation-id": "conversation-B",
+    "x-kelivo-assistant-id": "other"
   });
-  assert.equal(loadKelivoSyncContext().conversation_id, "conversation-A");
+  assert.equal(loadKelivoSyncContext(targetA).conversation_id, "conversation-A");
   const invalidHeaderResponse = await publicInject({
     method: "POST",
     url: "/v1/chat/completions",
@@ -223,7 +245,7 @@ test("proactive API、conversation binding 与 wake-up 同步保持隔离且连�
   assert.equal(invalidLimit.statusCode, 400);
 
   // O. 手工测试端点默认 404；打开开关后只创建 inbox event，不触发模型、Bark 或 timeline。
-  const timelineBeforeManualTest = fs.readFileSync(path.join(dataDirectory, "enhanced_messages.json"), "utf8");
+  const timelineBeforeManualTest = fs.readFileSync(getConversationStatePaths(targetA).timeline_file, "utf8");
   const upstreamBeforeManualTest = upstreamRequests.length;
   const barkBeforeManualTest = barkPayloads.length;
   const disabledManual = await publicInject({
@@ -252,30 +274,29 @@ test("proactive API、conversation binding 与 wake-up 同步保持隔离且连�
   assert.equal(JSON.parse(enabledManual.body).push_provider, "none");
   assert.equal(upstreamRequests.length, upstreamBeforeManualTest);
   assert.equal(barkPayloads.length, barkBeforeManualTest);
-  assert.equal(fs.readFileSync(path.join(dataDirectory, "enhanced_messages.json"), "utf8"), timelineBeforeManualTest);
+  assert.equal(fs.readFileSync(getConversationStatePaths(targetA).timeline_file, "utf8"), timelineBeforeManualTest);
   process.env.PROACTIVE_SYNC_TEST_ENABLED = "false";
   removeRuntimeFile("proactive_events.json");
 
   // J. Bark 成功后，wake event 仍写 timeline，同时创建绑定到 conversation-A 的主动事件。
   const wakeUser = { role: "user", content: "等待主动消息的用户" };
-  writeJson("enhanced_messages.json", [system, wakeUser]);
-  writeJson("message_timestamps.json", {});
+  writeStateJson(targetA, "timeline", [system, wakeUser]);
+  writeStateJson(targetA, "timestamps", {});
   setRememberedTime(wakeUser);
   barkShouldFail = false;
-  enqueueModelReply("想你了，在忙吗？");
+  enqueueModelReply(structured("send", "想你了，在忙吗？"));
   await runWakeUp();
   const successfulBark = barkPayloads.at(-1);
   assert.equal(successfulBark.title, "阿言");
   assert.equal(successfulBark.body, "想你了，在忙吗？");
   const successfulWakeEventPayload = wakeEventPayloads.at(-1);
-  assert.deepEqual(successfulWakeEventPayload.proactive, {
-    title: successfulBark.title,
-    body: successfulBark.body,
-    provider: "bark",
-    sent_at: successfulWakeEventPayload.proactive.sent_at
-  });
+  assert.equal(successfulWakeEventPayload.binding.conversation_id, targetA.conversation_id);
+  assert.equal(successfulWakeEventPayload.binding.assistant_id, targetA.assistant_id);
+  assert.equal(successfulWakeEventPayload.proactive.title, successfulBark.title);
+  assert.equal(successfulWakeEventPayload.proactive.body, successfulBark.body);
+  assert.equal(successfulWakeEventPayload.proactive.provider, "bark");
   assert.ok(!Number.isNaN(new Date(successfulWakeEventPayload.proactive.sent_at).getTime()));
-  const wakeTimeline = readJson("enhanced_messages.json", []);
+  const wakeTimeline = stateJson(targetA, "timeline", []);
   assert.ok(wakeTimeline.some(message => isSpecialEventContent(message.content)));
   const wakeStore = loadProactiveStore();
   assert.equal(wakeStore.events.length, 1);
@@ -318,16 +339,15 @@ test("proactive API、conversation binding 与 wake-up 同步保持隔离且连�
   });
   assert.deepEqual(JSON.parse(isolatedRead.body).data, []);
 
-  // K / L. [NO_ACTION] 与只写日记仍记录原 special event，但不创建 proactive inbox event。
+  // K / L. action=skip 和不合法自由输出都不能创建 proactive inbox event。
   const countBeforeSilentWake = loadProactiveStore().events.length;
-  enqueueModelReply("[NO_ACTION]");
+  enqueueModelReply(structured("skip"));
   await runWakeUp();
-  assert.equal(Object.hasOwn(wakeEventPayloads.at(-1), "proactive"), false);
+  assert.equal(loadProactiveStore().events.length, countBeforeSilentWake);
   enqueueModelReply("[DIARY]只写日记[/DIARY]");
   await runWakeUp();
-  assert.equal(Object.hasOwn(wakeEventPayloads.at(-1), "proactive"), false);
   assert.equal(loadProactiveStore().events.length, countBeforeSilentWake);
-  assert.ok(fs.existsSync(path.join(dataDirectory, "diary")));
+  assert.equal(fs.existsSync(path.join(dataDirectory, "diary")), false);
 
   // M. Bark 失败不创建 event，wake scheduler 仍会安排下一次检查。
   barkShouldFail = true;
@@ -337,24 +357,23 @@ test("proactive API、conversation binding 与 wake-up 同步保持隔离且连�
     scheduled.push({ callback, delay });
     return { unref() {} };
   };
-  enqueueModelReply("这次 Bark 会失败");
+  enqueueModelReply(structured("send", "这次 Bark 会失败"));
   try {
     await scheduleNextCheck();
   } finally {
     global.setTimeout = originalSetTimeout;
     barkShouldFail = false;
   }
-  assert.equal(Object.hasOwn(wakeEventPayloads.at(-1), "proactive"), false);
   assert.equal(loadProactiveStore().events.length, countBeforeSilentWake);
-  assert.ok(readJson("enhanced_messages.json", []).some(message => isSpecialEventContent(message.content)));
+  assert.ok(stateJson(targetA, "timeline", []).some(message => isSpecialEventContent(message.content)));
   assert.equal(scheduled.length, 1);
   assert.equal(scheduled[0].delay, 60_000);
 
-  // N. 缺少 conversation binding 时，Bark 和 special event 保持成功，但 inbox 不写入任何猜测会话。
-  removeRuntimeFile("kelivo_sync_context.json");
+  // N. 缺少可靠 conversation binding 时 fail closed，不发送也不猜测会话。
+  removeRuntimeFile("kelivo_sync_context_v2.json");
   const countBeforeMissingContext = loadProactiveStore().events.length;
-  enqueueModelReply("没有绑定也能正常推送");
+  enqueueModelReply(structured("send", "没有绑定不能推送"));
   await runWakeUp();
   assert.equal(loadProactiveStore().events.length, countBeforeMissingContext);
-  assert.equal(barkPayloads.at(-1).body, "没有绑定也能正常推送");
+  assert.notEqual(barkPayloads.at(-1)?.body, "没有绑定不能推送");
 });

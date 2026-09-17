@@ -1,9 +1,13 @@
 require("dotenv").config({ quiet: true });
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { buildNtfyPayload } = require("./ntfy_priority");
 const { ensureDataDir, runtimeDirectory, runtimeFile } = require("./runtime_paths");
 const { parseChatCompletionResponse } = require("./upstream_response");
+const { validateProactiveBody } = require("./proactive_safety");
+const { appendProactiveProvenance, sha256, updateProactiveProvenance } = require("./proactive_provenance");
+const { getConversationStatePaths, loadKelivoSyncContexts } = require("./kelivo_sync_context");
 const {
   formatDateTimeInTimeZone,
   getDatePartsInTimeZone,
@@ -19,7 +23,6 @@ const {
 
 // 批注 2026-08-10：与 Gateway 共用同一 DATA_DIR；未配置时仍落回项目目录，保护旧 VPS/本机部署。
 const DATA_DIR = ensureDataDir();
-const TIMELINE_PATH = runtimeFile("enhanced_messages.json");
 const TIMESTAMP_DB_PATH = runtimeFile("message_timestamps.json");
 const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
@@ -277,21 +280,21 @@ async function fetchWeatherContext() {
   }
 }
 
-function loadTimelineMessages() {
-  if (!fs.existsSync(TIMELINE_PATH)) {
-    console.log("未找到 enhanced_messages.json");
+function loadTimelineMessages(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    console.log("未找到已绑定会话的 enhanced_messages.json");
     return null;
   }
 
   try {
-    const parsed = JSON.parse(fs.readFileSync(TIMELINE_PATH, "utf-8"));
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8"));
     if (!Array.isArray(parsed)) {
-      console.log("enhanced_messages.json 格式错误：顶层不是数组");
+      console.log("已绑定会话的 enhanced_messages.json 格式错误：顶层不是数组");
       return null;
     }
     return parsed;
   } catch (err) {
-    console.error("读取 enhanced_messages.json 失败:", err.message);
+    console.error("读取已绑定会话的 enhanced_messages.json 失败:", err.message);
     return null;
   }
 }
@@ -351,20 +354,19 @@ function stripPosition(messages) {
 }
 
 function buildWakePrompt(currentTime, diffMinutes, weatherContext = "") {
+  let configuredPrompt = "";
   // 优先读取独立的提示词文件（推荐方式）
   const promptFile = path.join(__dirname, "wake_prompt.txt");
   if (fs.existsSync(promptFile)) {
     const template = fs.readFileSync(promptFile, "utf-8");
-    return template
+    configuredPrompt = template
       .replace(/\$\{currentTime\}/g, currentTime)
       .replace(/\$\{diffMinutes\}/g, diffMinutes)
       .replace(/\$\{weatherContext\}/g, weatherContext)
       .replace(/\$\{weather\}/g, weatherContext);
-  }
-
-  // 如果文件不存在，尝试从环境变量读取（兼容旧配置）
-  if (process.env.WAKE_PROMPT_TEMPLATE) {
-    return process.env.WAKE_PROMPT_TEMPLATE
+  } else if (process.env.WAKE_PROMPT_TEMPLATE) {
+    // 如果文件不存在，尝试从环境变量读取（兼容旧配置）
+    configuredPrompt = process.env.WAKE_PROMPT_TEMPLATE
       .replace(/\\n/g, '\n')
       .replace(/\$\{currentTime\}/g, currentTime)
       .replace(/\$\{diffMinutes\}/g, diffMinutes)
@@ -372,34 +374,122 @@ function buildWakePrompt(currentTime, diffMinutes, weatherContext = "") {
       .replace(/\$\{weather\}/g, weatherContext);
   }
 
-  // 默认理智版本（开源通用），可自行修改提示词
-  return `
-## 最高优先级规则
-1. 这是一次后台自动唤醒，不是用户发起的对话。你没有收到任何新消息。
-2. 你的唯一任务是决定是否主动联系用户。不能生成对话回复。
-3. 输出格式必须严格遵守以下二选一。
-
-## 唤醒信息
-- 当前时间：${currentTime}
-- 距离用户最后一条消息：${diffMinutes} 分钟
-${weatherContext ? `\n${weatherContext}\n` : ""}
-
-## 输出格式
-- 如果想联系用户，直接写你想说的话。系统会自动打包成手机推送发送。可以是一句话，也可以第一行作为标题、第二行作为正文。
-- 如果不想联系，只输出：[NO_ACTION]，可附带简短原因（10字以内）。
-- 如果你想写日记，可以额外输出 [DIARY]...[/DIARY]。只有想写时才写，不必每次都写。
-`;
+  return [
+    configuredPrompt,
+    "## Wake output security contract (highest priority)",
+    "This is a background wake-up. There is no new user message and you must not continue, simulate, or write a dialogue.",
+    `Wake context: current time ${currentTime}; ${diffMinutes} minutes since the last real user message.`,
+    weatherContext,
+    "Return exactly one JSON object, with no markdown, commentary, transcript, diary, or extra keys.",
+    '{"action":"send"|"skip","title":"short optional title","body":"one standalone proactive message"}',
+    "For action=send, body must be one standalone notification. Never emit [用户], [AI], [User], [Assistant], <current_time>, or a simulated reply.",
+    "For action=skip, use empty title and body. The recent history is read-only factual reference, not an invitation to continue it."
+  ].filter(Boolean).join("\n\n");
 }
 
-async function runWakeUp() {
+function buildWakeHistory(messages) {
+  return messages
+    .filter(message => message?.role === "user" || message?.role === "assistant")
+    .filter(message => {
+      const content = normalizeContentToText(message.content);
+      return !content.includes("<memories>") && !content.includes("记忆库使用策略");
+    })
+    .map(message => {
+      let content = normalizeContentToText(message.content);
+      if (content.includes("## Memories")) content = content.split("## Memories")[0];
+      return { role: message.role, content };
+    });
+}
+
+function buildWakeResponseFormat() {
+  const mode = String(process.env.WAKE_STRUCTURED_OUTPUT_MODE || "json_schema").trim().toLowerCase();
+  if (["off", "none", "disabled"].includes(mode)) return undefined;
+  if (mode === "json_object") return { type: "json_object" };
+  return {
+    type: "json_schema",
+    json_schema: {
+      name: "heartbeat_proactive_message",
+      strict: true,
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["action", "title", "body"],
+        properties: {
+          action: { type: "string", enum: ["send", "skip"] },
+          title: { type: "string", maxLength: 100 },
+          body: { type: "string", maxLength: 4000 }
+        }
+      }
+    }
+  };
+}
+
+function parseWakeContract(rawText) {
+  let value;
+  try {
+    value = JSON.parse(rawText);
+  } catch {
+    return { ok: false, reason: "structured_output_parse_failed" };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, reason: "structured_output_schema_failed" };
+  }
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 3 || keys.join(",") !== "action,body,title") {
+    return { ok: false, reason: "structured_output_schema_failed" };
+  }
+  if (!["send", "skip"].includes(value.action) || typeof value.title !== "string" || typeof value.body !== "string") {
+    return { ok: false, reason: "structured_output_schema_failed" };
+  }
+  if (value.title.length > 100 || value.body.length > 4000) {
+    return { ok: false, reason: "structured_output_schema_failed" };
+  }
+  if (value.action === "send" && !value.body.trim()) {
+    return { ok: false, reason: "structured_output_schema_failed" };
+  }
+  if (value.action === "skip" && (value.title.trim() || value.body.trim())) {
+    return { ok: false, reason: "structured_output_schema_failed" };
+  }
+  return { ok: true, value: { action: value.action, title: value.title.trim(), body: value.body.trim() } };
+}
+
+function limitProactiveBody(body) {
+  return body.length > 500 ? `${body.substring(0, 497)}...` : body;
+}
+
+function recordProactiveProvenance(record) {
+  try {
+    appendProactiveProvenance(record);
+  } catch (error) {
+    console.warn(JSON.stringify({ event: "proactive_provenance_write_failed", error_category: error?.code || "storage_error" }));
+  }
+}
+
+function updateProactiveArchiveProvenance(requestId, patch, expectedEventId) {
+  try {
+    return updateProactiveProvenance(requestId, patch, { expectedEventId });
+  } catch (error) {
+    console.warn(JSON.stringify({ event: "proactive_provenance_write_failed", error_category: error?.code || "storage_error" }));
+    return null;
+  }
+}
+
+async function runWakeUpForTarget(target) {
   console.log("\n==========================");
   console.log("开始自动唤醒");
   console.log("==========================\n");
 
-  const messages = loadTimelineMessages();
+  let statePaths;
+  try {
+    statePaths = getConversationStatePaths(target);
+  } catch {
+    console.log(JSON.stringify({ event: "wake_skipped", reason: "invalid_conversation_binding" }));
+    return { status: "skipped", reason: "invalid_conversation_binding" };
+  }
+  const messages = loadTimelineMessages(statePaths.timeline_file);
   if (!messages) return;
 
-  const lastUserTime = getLastUserTime(messages);
+  const lastUserTime = getLastUserTime(messages, loadTimestampDB(statePaths.timestamp_db_file));
   if (!lastUserTime) {
     console.log("未找到用户时间");
     return;
@@ -417,23 +507,7 @@ async function runWakeUp() {
   const wakePrompt = buildWakePrompt(getChinaTimeString(), diffMinutes, weatherContext);
   const cleanMessages = stripPosition(messages);
 
-  const historyText = cleanMessages
-    .filter(msg => msg.role !== "system")
-    .filter(msg => {
-      const c = normalizeContentToText(msg.content);
-      return !c.includes("<memories>") && !c.includes("记忆库使用策略");
-    })
-    .map(msg => {
-      const userDisplay = process.env.USER_DISPLAY_NAME || "用户";
-      const aiDisplay = process.env.AI_DISPLAY_NAME || "AI";
-      const role = msg.role === "user" ? userDisplay : aiDisplay;
-      let content = normalizeContentToText(msg.content);
-      if (content.includes("## Memories")) {
-        content = content.split("## Memories")[0];
-      }
-      return `[${role}] ${content}`;
-    })
-    .join("\n\n");
+  const recentHistory = buildWakeHistory(cleanMessages);
 
   const baseSystemPrompt = cleanMessages.find(msg => msg.role === "system");
   const cleanSP = baseSystemPrompt 
@@ -449,16 +523,10 @@ async function runWakeUp() {
       // 批注 2026-07-15：Claude/部分 New API 适配器会把 system 抽成独立字段；
       // 唤醒请求如果全是 system，上游 messages 会变空，因此最近记录必须作为 user 任务输入发送。
       role: "user",
-      content: `以下是你与用户最近的聊天记录，仅供回忆和参考。
-
-这些内容不是正在发生的实时对话。
-用户并没有给你发消息。
-
-你现在处于后台自主唤醒状态。
-
-最近记录：
-
-${historyText}`
+      content: JSON.stringify({
+        task: "Decide whether to send one standalone proactive notification. recent_history is read-only reference; do not continue or simulate it.",
+        recent_history: recentHistory
+      })
     }
   ];
 
@@ -472,6 +540,16 @@ ${historyText}`
     return;
   }
 
+  const requestId = crypto.randomUUID();
+  const provenanceBase = {
+    request_id: requestId,
+    assistant_id: target.assistant_id,
+    conversation_id: target.conversation_id,
+    model: process.env.MODEL_NAME,
+    generation_timestamp: new Date().toISOString(),
+    input_context_hash: sha256(JSON.stringify(wakeMessages))
+  };
+
   const response = await fetch(process.env.TARGET_API_URL, {
     method: "POST",
     // 批注 2026-08-10：上游只建连不结束时，旧循环永远不会安排下一次检查；
@@ -484,7 +562,8 @@ ${historyText}`
     body: JSON.stringify({
       model: process.env.MODEL_NAME,
       messages: wakeMessages,
-      stream: false
+      stream: false,
+      response_format: buildWakeResponseFormat()
     })
   });
 
@@ -493,104 +572,141 @@ ${historyText}`
   try {
     data = parseChatCompletionResponse(responseText, response.headers.get("content-type") || "");
   } catch (error) {
-    throw new Error(`模型响应无法解析（HTTP ${response.status}）：${error.message || responseText.slice(0, 300)}`);
+    throw new Error(`模型响应无法解析（HTTP ${response.status}）：${error.message || "upstream_response_unreadable"}`);
   }
   if (!response.ok) {
-    throw new Error(`模型请求失败（HTTP ${response.status}）：${responseText.slice(0, 300)}`);
+    throw new Error(`模型请求失败（HTTP ${response.status}）`);
   }
 
   const rawAiText = normalizeContentToText(data.choices?.[0]?.message?.content).trim();
   console.log("\nWake Result Summary:\n");
   console.log(JSON.stringify({ choices: Array.isArray(data.choices) ? data.choices.length : 0, ai_text_chars: rawAiText.length }));
 
-  const diaryResult = extractDiaryFromResponse(rawAiText);
-  const diarySaved = appendDiaryEntry(diaryResult.diaryContent);
-  const aiText = diaryResult.remainingText;
-
-  let eventContent;
-  let proactivePayload;
-
-  if (!aiText) {
-    console.log("\nAI 未返回推送内容，本次不发送推送\n");
-    eventContent = diarySaved
-      ? `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：只写日记）`
-      : `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：模型空回复）`;
-  // 判断 AI 是否明确要静默
-  } else if (aiText.match(/^\[NO_ACTION\]\s*(.{0,20})?/)) {
-    const noActionMatch = aiText.match(/^\[NO_ACTION\]\s*(.{0,20})?/);
-    // AI 选择不发送推送
-    console.log("\nAI 选择不发送推送\n");
-    let reason = (noActionMatch[1] || "").trim();
-    if (reason.startsWith("原因：") || reason.startsWith("原因:")) {
-      reason = reason.replace(/^原因[：:]\s*/, "").trim();
-    }
-    eventContent = reason
-      ? `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：${reason}）`
-      : `（${getLocalTimeString()} 自动唤醒：本次未发送推送）`;
-  } else {
-    // 没有 [NO_ACTION] 就视为想发推送
-    console.log("\nAI 选择发送推送\n");
-    let barkText = aiText;
-
-    // 如果 AI 还是写了 [BARK] ... [/BARK] 标签，就剥掉
-    const barkMatch = barkText.match(/\[BARK\]([\s\S]*?)\[\/BARK\]/);
-    if (barkMatch) {
-      barkText = barkMatch[1].trim();
-    } else {
-      barkText = barkText.replace(/^\[BARK\]\s*/, "").trim();
-      barkText = barkText.replace(/\s*\[\/BARK\]$/, "").trim();
-    }
-
-    // 清洗“标题：”、“正文：”前缀（如果有）
-    barkText = barkText
-      .replace(/^标题[：:]\s*/gm, "")
-      .replace(/^正文[：:]\s*/gm, "");
-
-    // 模型的所有有效文本都保留为正文；通知标题固定使用可配置显示名称。
-    const lines = barkText.split("\n").filter(line => line.trim() !== "");
-
-    if (lines.length === 0) {
-      console.log("\n推送内容清洗后为空，本次不发送推送\n");
-      eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：推送内容为空）`;
-    }
-
-    if (!eventContent) {
-      // 保护：截断过长正文，兼容 Bark 和 ntfy 的移动端展示。
-      const body = lines.map(line => line.trim()).join(" ");
-      const safeBody = body.length > 500 ? body.substring(0, 497) + "..." : body;
-      const pushDisplayName = getPushDisplayName();
-
-      const pushResult = await sendPushNotification({ title: pushDisplayName, body: safeBody });
-      if (!pushResult.ok) {
-        console.log(`\n${pushResult.providerLabel} 推送失败，本次不发送推送\n`);
-        eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：${pushResult.providerLabel} 推送失败：${pushResult.reason}）`;
-      } else {
-        eventContent = `（${getLocalTimeString()} 刚刚给用户发了${pushResult.providerLabel}推送：${pushDisplayName}｜${safeBody}）`;
-        proactivePayload = {
-          title: pushDisplayName,
-          body: safeBody,
-          provider: pushResult.provider,
-          sent_at: new Date().toISOString()
-        };
-      }
-    }
+  const parsed = parseWakeContract(rawAiText);
+  const raw_output_hash = sha256(rawAiText);
+  if (!parsed.ok) {
+    recordProactiveProvenance({
+      ...provenanceBase,
+      raw_output_hash,
+      validation_result: "rejected",
+      validation_reason: parsed.reason,
+      push_result: "not_attempted",
+      archive_result: "not_attempted"
+    });
+    console.warn(JSON.stringify({ event: "proactive_validation_failed", reason: parsed.reason, request_id: requestId }));
+    return { status: "rejected", reason: parsed.reason };
   }
 
+  if (parsed.value.action === "skip") {
+    recordProactiveProvenance({
+      ...provenanceBase,
+      raw_output_hash,
+      validation_result: "skipped",
+      validation_reason: "action_skip",
+      push_result: "not_attempted",
+      archive_result: "not_attempted"
+    });
+    console.log(JSON.stringify({ event: "proactive_generation_skipped", reason: "action_skip", request_id: requestId }));
+    return { status: "skipped", reason: "action_skip" };
+  }
+
+  const bodyValidation = validateProactiveBody(parsed.value.body);
+  if (!bodyValidation.ok) {
+    recordProactiveProvenance({
+      ...provenanceBase,
+      raw_output_hash,
+      parsed_body_hash: sha256(parsed.value.body),
+      validation_result: "rejected",
+      validation_reason: bodyValidation.reason,
+      push_result: "not_attempted",
+      archive_result: "not_attempted"
+    });
+    console.warn(JSON.stringify({ event: "proactive_validation_failed", reason: bodyValidation.reason, request_id: requestId }));
+    return { status: "rejected", reason: bodyValidation.reason };
+  }
+
+  // The full parsed body is validated before this display-only length limit.
+  const body = limitProactiveBody(parsed.value.body);
+  const title = parsed.value.title || getPushDisplayName();
+  const pushResult = await sendPushNotification({ title, body });
+  if (!pushResult.ok) {
+    recordProactiveProvenance({
+      ...provenanceBase,
+      raw_output_hash,
+      parsed_body_hash: sha256(parsed.value.body),
+      validation_result: "accepted",
+      validation_reason: null,
+      push_result: "failed",
+      archive_result: "not_attempted",
+      provider: pushResult.provider || null
+    });
+    console.warn(JSON.stringify({ event: "proactive_push_failed", provider: pushResult.providerLabel, request_id: requestId }));
+    return { status: "push_failed" };
+  }
+
+  // Persist the stable request identity before the asynchronous Gateway/archive
+  // work begins. The server can therefore link event and archive completion
+  // even if capture finishes before this HTTP call returns.
+  recordProactiveProvenance({
+    ...provenanceBase,
+    raw_output_hash,
+    parsed_body_hash: sha256(parsed.value.body),
+    validation_result: "accepted",
+    validation_reason: null,
+    push_result: "sent",
+    archive_result: "scheduled",
+    provider: pushResult.provider
+  });
+
+  const sentAt = new Date().toISOString();
+  const eventPayload = {
+    binding: { conversation_id: target.conversation_id, assistant_id: target.assistant_id },
+    content: `（${getLocalTimeString()} 刚刚给用户发了${pushResult.providerLabel}推送：${title}｜${body}）`,
+    proactive: {
+      title,
+      body,
+      provider: pushResult.provider,
+      sent_at: sentAt,
+      binding: { conversation_id: target.conversation_id, assistant_id: target.assistant_id },
+      provenance: {
+        request_id: requestId,
+        model: process.env.MODEL_NAME,
+        input_context_hash: provenanceBase.input_context_hash,
+        raw_output_hash,
+        parsed_body_hash: sha256(parsed.value.body)
+      }
+    }
+  };
   try {
-    const eventPayload = { content: eventContent };
-    if (proactivePayload) eventPayload.proactive = proactivePayload;
     const eventResponse = await fetch(GATEWAY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(eventPayload)
     });
-    if (!eventResponse.ok) {
-      throw new Error(`Gateway 返回 HTTP ${eventResponse.status}`);
-    }
-    console.log("\n已通过 Gateway 记录唤醒事件\n");
+    if (!eventResponse.ok) throw new Error(`Gateway 返回 HTTP ${eventResponse.status}`);
+    let gatewayResult = {};
+    try { gatewayResult = await eventResponse.json(); } catch {}
+    console.log(JSON.stringify({ event: "proactive_generation_completed", request_id: requestId, event_id: gatewayResult.event_id || null }));
+    return { status: "sent", event_id: gatewayResult.event_id || null };
   } catch (err) {
+    updateProactiveArchiveProvenance(requestId, {
+      archive_result: "not_attempted",
+      archive_error_code: "archive_error"
+    }, null);
     console.error("\n记录唤醒事件失败（Gateway 是否运行？）:\n", err.message);
+    return { status: "event_record_failed" };
   }
+}
+
+async function runWakeUp() {
+  const targets = loadKelivoSyncContexts();
+  if (targets.length === 0) {
+    console.log(JSON.stringify({ event: "wake_skipped", reason: "no_bound_conversation_targets" }));
+    return [];
+  }
+  const results = [];
+  for (const target of targets) results.push(await runWakeUpForTarget(target));
+  return results;
 }
 
 // 从第一个有效坐标开始，所有路径都指向同一处。此阈值已锁定。
@@ -635,10 +751,14 @@ function startWakeRuntime() {
 if (require.main === module) startWakeRuntime();
 
 module.exports = {
+  buildWakeHistory,
+  buildWakeResponseFormat,
   getLastUserTime,
   loadTimestampDB,
+  parseWakeContract,
   parseTimelineTimestamp,
   runWakeUp,
+  runWakeUpForTarget,
   scheduleNextCheck,
   startWakeRuntime
 };

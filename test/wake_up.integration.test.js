@@ -27,17 +27,30 @@ process.env.WAKE_DAY_START_HOUR = "0";
 process.env.WAKE_DAY_END_HOUR = "24";
 
 const { makeFingerprint } = require("../timestamp_memory");
+const { getConversationStatePaths, saveKelivoSyncContext } = require("../kelivo_sync_context");
 const { runWakeUp, scheduleNextCheck } = require("../wake_up");
+
+const wakeTarget = { conversation_id: "wake-integration", assistant_id: "ayan" };
+
+function structured(action, body = "", title = "") {
+  return JSON.stringify({ action, title, body });
+}
 
 function writeWakeState(content = "没有时间戳的最后消息") {
   const userMessage = { role: "user", content };
-  fs.writeFileSync(path.join(dataDirectory, "enhanced_messages.json"), JSON.stringify([
+  const state = getConversationStatePaths(wakeTarget);
+  fs.mkdirSync(state.directory, { recursive: true });
+  fs.writeFileSync(state.timeline_file, JSON.stringify([
     { role: "system", content: "系统设定" },
     userMessage
   ]), "utf8");
-  fs.writeFileSync(path.join(dataDirectory, "message_timestamps.json"), JSON.stringify({
+  fs.writeFileSync(state.timestamp_db_file, JSON.stringify({
     [makeFingerprint(userMessage)]: new Date(Date.now() - 5 * 60 * 1000).toISOString()
   }), "utf8");
+  saveKelivoSyncContext({
+    ...wakeTarget,
+    latest_user_fingerprint: makeFingerprint(userMessage)
+  });
 }
 
 function jsonResponse(status, body) {
@@ -60,7 +73,7 @@ test("wake-up 使用最小 Requesty Chat Completions payload 并发送 Bark", as
       requests.push({ url: String(url), options });
       if (url === requestyUrl) {
         return jsonResponse(200, {
-          choices: [{ message: { role: "assistant", content: "想你了，在忙吗？" } }]
+          choices: [{ message: { role: "assistant", content: structured("send", "想你了，在忙吗？") } }]
         });
       }
       if (url === "https://api.day.app/push") return jsonResponse(200, { code: 200 });
@@ -77,17 +90,18 @@ test("wake-up 使用最小 Requesty Chat Completions payload 并发送 Bark", as
   assert.ok(upstreamRequest);
   assert.equal(upstreamRequest.options.headers.Authorization, "Bearer wake-test-key");
   const upstreamBody = JSON.parse(upstreamRequest.options.body);
-  assert.deepEqual(Object.keys(upstreamBody).sort(), ["messages", "model", "stream"]);
+  assert.deepEqual(Object.keys(upstreamBody).sort(), ["messages", "model", "response_format", "stream"]);
   assert.equal(upstreamBody.model, "anthropic/claude-sonnet-4-6");
   assert.equal(upstreamBody.stream, false);
   assert.equal(upstreamBody.messages.length, 2);
   assert.deepEqual(upstreamBody.messages.map(message => message.role), ["system", "user"]);
   for (const key of [
     "temperature", "top_p", "max_tokens", "max_completion_tokens",
-    "frequency_penalty", "presence_penalty", "response_format", "tools", "tool_choice"
+    "frequency_penalty", "presence_penalty", "tools", "tool_choice"
   ]) {
     assert.equal(Object.hasOwn(upstreamBody, key), false);
   }
+  assert.equal(upstreamBody.response_format.type, "json_schema");
   assert.equal(requests.filter(request => request.url === "https://api.day.app/push").length, 1);
   assert.equal(requests.filter(request => request.url === `${gatewayBaseUrl}/internal/wake-event`).length, 1);
   const barkPayload = JSON.parse(requests.find(request => request.url === "https://api.day.app/push").options.body);
@@ -105,7 +119,7 @@ test("两行主动消息完整保留为正文，显示名称不取模型首行",
       requests.push({ url: String(url), options });
       if (url === requestyUrl) {
         return jsonResponse(200, {
-          choices: [{ message: { role: "assistant", content: "想你了\n早点休息呀" } }]
+          choices: [{ message: { role: "assistant", content: structured("send", "想你了\n早点休息呀") } }]
         });
       }
       if (url === "https://api.day.app/push") return jsonResponse(200, { code: 200 });
@@ -135,7 +149,7 @@ test("未设置 PUSH_DISPLAY_NAME 时默认使用阿言", async () => {
       requests.push({ url: String(url), options });
       if (url === requestyUrl) {
         return jsonResponse(200, {
-          choices: [{ message: { role: "assistant", content: "默认名称测试" } }]
+          choices: [{ message: { role: "assistant", content: structured("send", "默认名称测试") } }]
         });
       }
       if (url === "https://api.day.app/push") return jsonResponse(200, { code: 200 });
@@ -153,7 +167,7 @@ test("未设置 PUSH_DISPLAY_NAME 时默认使用阿言", async () => {
   assert.equal(barkPayload.title, "阿言");
 });
 
-test("[NO_ACTION] 与 [DIARY] 保持静默、写入日记并记录事件", async () => {
+test("action=skip 保持静默且不创建 event 或日记", async () => {
   writeWakeState("需要保持静默的消息");
   const originalFetch = global.fetch;
   const requests = [];
@@ -162,7 +176,7 @@ test("[NO_ACTION] 与 [DIARY] 保持静默、写入日记并记录事件", async
       requests.push({ url: String(url), options });
       if (url === requestyUrl) {
         return jsonResponse(200, {
-          choices: [{ message: { role: "assistant", content: "[DIARY]测试日记[/DIARY]\n[NO_ACTION]" } }]
+          choices: [{ message: { role: "assistant", content: structured("skip") } }]
         });
       }
       if (url === `${gatewayBaseUrl}/internal/wake-event`) return jsonResponse(200, { success: true });
@@ -175,11 +189,9 @@ test("[NO_ACTION] 与 [DIARY] 保持静默、写入日记并记录事件", async
   }
 
   assert.equal(requests.filter(request => request.url === "https://api.day.app/push").length, 0);
-  assert.equal(requests.filter(request => request.url === `${gatewayBaseUrl}/internal/wake-event`).length, 1);
+  assert.equal(requests.filter(request => request.url === `${gatewayBaseUrl}/internal/wake-event`).length, 0);
   const diaryDirectory = path.join(dataDirectory, "diary");
-  const diaryFiles = fs.readdirSync(diaryDirectory);
-  assert.equal(diaryFiles.length, 1);
-  assert.match(fs.readFileSync(path.join(diaryDirectory, diaryFiles[0]), "utf8"), /测试日记/);
+  assert.equal(fs.existsSync(diaryDirectory), false);
 });
 
 for (const status of [400, 500]) {

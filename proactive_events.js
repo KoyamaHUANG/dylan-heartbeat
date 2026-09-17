@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const { runtimeFile, writeJsonAtomicSync } = require("./runtime_paths");
+const { validateProactiveBody } = require("./proactive_safety");
 
 const STORE_VERSION = 1;
 const DEFAULT_MAX_COUNT = 5000;
@@ -53,8 +54,8 @@ function normalizeProvider(value) {
   return provider;
 }
 
-function validateProactiveEventInput(input = {}) {
-  return {
+function validateProactiveEventInput(input = {}, { enforceBodySafety = false } = {}) {
+  const normalized = {
     conversation_id: normalizeIdentifier(input.conversation_id, {
       field: "conversation_id",
       required: true,
@@ -69,6 +70,11 @@ function validateProactiveEventInput(input = {}) {
     source: normalizeSource(input.source),
     push_provider: normalizeProvider(input.push_provider)
   };
+  if (enforceBodySafety) {
+    const safety = validateProactiveBody(normalized.body);
+    if (!safety.ok) throw validationError(`body safety validation failed: ${safety.reason}`);
+  }
+  return normalized;
 }
 
 function createEmptyStore() {
@@ -136,7 +142,7 @@ function resolveMaxCount(value = process.env.PROACTIVE_EVENT_MAX_COUNT) {
 }
 
 function appendProactiveEvent(input, { filePath = DEFAULT_FILE_PATH, maxCount } = {}) {
-  const normalized = validateProactiveEventInput(input);
+  const normalized = validateProactiveEventInput(input, { enforceBodySafety: true });
   const store = loadProactiveStore(filePath);
   const event = {
     event_id: crypto.randomUUID(),

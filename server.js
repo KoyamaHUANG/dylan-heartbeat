@@ -23,10 +23,13 @@ const { registerArchiveRoutes } = require("./archive/archive_routes");
 const { RawChatArchiveService, buildChatCaptureInput } = require("./archive/archive_sync");
 const { validateArchiveIdentity } = require("./archive/archive_protocol");
 const {
-  loadKelivoSyncContext,
+  getConversationStatePaths,
   parseKelivoSyncHeaders,
-  saveKelivoSyncContext
+  saveKelivoSyncContext,
+  validateKelivoSyncContext
 } = require("./kelivo_sync_context");
+const { validateProactiveBody } = require("./proactive_safety");
+const { updateProactiveProvenance } = require("./proactive_provenance");
 const {
   formatDateTimeInTimeZone,
   resolveTimeZone
@@ -95,7 +98,63 @@ function defaultProactiveTitle() {
 }
 
 function isInputValidationError(error) {
-  return error?.code === "PROACTIVE_EVENT_VALIDATION" || error?.code === "KELIVO_SYNC_CONTEXT_VALIDATION";
+  return error?.code === "PROACTIVE_EVENT_VALIDATION" || error?.code === "KELIVO_SYNC_CONTEXT_VALIDATION" || error?.code === "PROACTIVE_BODY_VALIDATION";
+}
+
+function proactiveBodyValidationError(reason) {
+  const error = new Error(reason);
+  error.code = "PROACTIVE_BODY_VALIDATION";
+  return error;
+}
+
+function safeArchiveErrorCode(value) {
+  const raw = String(value?.error_category || value?.code || value?.reason || "archive_error").trim().toLowerCase();
+  if (["econnrefused", "enotfound", "etimedout", "57p01"].includes(raw)) return "database_unavailable";
+  if (raw === "database_unavailable" || /^archive_[a-z0-9_]{1,80}$/.test(raw)) return raw;
+  return "archive_error";
+}
+
+function updateProactiveArchiveOutcome({ requestId, eventId, result, error }) {
+  if (!requestId || !eventId) return null;
+  const completedAt = new Date().toISOString();
+  const archiveMessageId = result?.archive_message_id == null ? null : String(result.archive_message_id).trim() || null;
+  const succeeded = !error && !result?.skipped && Boolean(archiveMessageId);
+  const patch = succeeded
+    ? {
+        archive_result: "success",
+        archive_message_id: archiveMessageId,
+        archive_completed_at: completedAt,
+        archive_error_code: null
+      }
+    : {
+        archive_result: "failed",
+        archive_message_id: null,
+        archive_completed_at: completedAt,
+        archive_error_code: safeArchiveErrorCode(error || result)
+      };
+  try {
+    const updated = updateProactiveProvenance(requestId, patch, { expectedEventId: eventId });
+    if (!updated) {
+      console.warn(JSON.stringify({ event: "proactive_archive_provenance_missing", request_id: requestId, event_id: eventId }));
+    }
+    return updated;
+  } catch (updateError) {
+    console.warn(JSON.stringify({
+      event: "proactive_archive_provenance_update_failed",
+      request_id: requestId,
+      event_id: eventId,
+      error_category: safeArchiveErrorCode(updateError)
+    }));
+    return null;
+  }
+}
+
+function normalizeWakeBinding(value) {
+  const normalized = validateKelivoSyncContext({
+    ...(value || {}),
+    latest_user_fingerprint: "wake-event-binding"
+  });
+  return { conversation_id: normalized.conversation_id, assistant_id: normalized.assistant_id };
 }
 
 function extractAssistantArchivePayload(responseText, contentType) {
@@ -124,17 +183,29 @@ function normalizeWakeProactivePayload(value) {
   const sentAt = new Date(String(value.sent_at || ""));
   if (Number.isNaN(sentAt.getTime())) throw new Error("invalid proactive sent_at");
   const normalized = validateProactiveEventInput({
-    conversation_id: "wake-proactive-validation",
+    conversation_id: value.binding?.conversation_id,
+    assistant_id: value.binding?.assistant_id,
     title: value.title,
     body: value.body,
     source: "wake",
     push_provider: value.provider
   });
+  const safety = validateProactiveBody(normalized.body);
+  if (!safety.ok) throw proactiveBodyValidationError(safety.reason);
+  const binding = normalizeWakeBinding(value.binding);
   return {
+    binding,
     title: normalized.title,
     body: normalized.body,
     provider: normalized.push_provider,
-    sent_at: sentAt.toISOString()
+    sent_at: sentAt.toISOString(),
+    provenance: value.provenance && typeof value.provenance === "object" ? {
+      request_id: String(value.provenance.request_id || "").trim() || null,
+      model: String(value.provenance.model || "").trim() || null,
+      input_context_hash: String(value.provenance.input_context_hash || "").trim() || null,
+      raw_output_hash: String(value.provenance.raw_output_hash || "").trim() || null,
+      parsed_body_hash: String(value.provenance.parsed_body_hash || "").trim() || null
+    } : {}
   };
 }
 
@@ -266,20 +337,20 @@ function safeJsonForInlineScript(value) {
 // ========================
 // 读取 timeline
 // ========================
-function loadTimeline() {
-  if (!fs.existsSync(TIMELINE_FILE)) return [];
-  try { return fs.readJsonSync(TIMELINE_FILE); } catch { return []; }
+function loadTimeline(filePath = TIMELINE_FILE) {
+  if (!fs.existsSync(filePath)) return [];
+  try { return fs.readJsonSync(filePath); } catch { return []; }
 }
 
 // ========================
 // 保存 timeline（保留 SP）
 // ========================
-function saveTimeline(messages) {
+function saveTimeline(messages, filePath = TIMELINE_FILE) {
   const sp = messages.find(m => m.role === "system");
   const nonSP = messages.filter(m => m.role !== "system");
   const trimmed = nonSP.slice(-49);
   const final = sp ? [sp, ...trimmed] : trimmed;
-  writeJsonAtomicSync(TIMELINE_FILE, final);
+  writeJsonAtomicSync(filePath, final);
 }
 
 // ========================
@@ -300,8 +371,8 @@ function loadTimestampDB(filePath = TIMESTAMP_DB_FILE) {
   } catch { return {}; }
 }
 
-function saveTimestampDB(db) {
-  writeJsonAtomicSync(TIMESTAMP_DB_FILE, db);
+function saveTimestampDB(db, filePath = TIMESTAMP_DB_FILE) {
+  writeJsonAtomicSync(filePath, db);
 }
 
 function extractTimestampWithMemory(msg, tsDB) {
@@ -451,8 +522,7 @@ function sanitizeMessageForUpstream(message) {
 // ========================
 // 构建 Timeline
 // ========================
-function buildTimeline(kelivoMessages, tsDB) {
-  const oldTimeline = loadTimeline();
+function buildTimeline(kelivoMessages, tsDB, oldTimeline = loadTimeline()) {
   const newSystemMessages = kelivoMessages
     .filter(msg => msg.role === "system")
     .map(normalizeMessageForTimeline);
@@ -511,20 +581,20 @@ function buildTimeline(kelivoMessages, tsDB) {
 // ========================
 // 追加特殊事件
 // ========================
-function appendSpecialEvent(content) {
-  const timeline = loadTimeline();
+function appendSpecialEvent(content, { timelineFile = TIMELINE_FILE, timestampDbFile = TIMESTAMP_DB_FILE } = {}) {
+  const timeline = loadTimeline(timelineFile);
   let maxPos = 0;
   for (const msg of timeline) {
     if (msg.position && msg.position > maxPos) maxPos = msg.position;
   }
   const newEvent = { role: "assistant", content, position: maxPos + 0.5 };
   const eventTime = new Date().toISOString();
-  const tsDB = loadTimestampDB();
+  const tsDB = loadTimestampDB(timestampDbFile);
   tsDB[makeFingerprint(newEvent)] = eventTime;
   tsDB[makeFingerprintStripped(newEvent)] = eventTime;
-  saveTimestampDB(tsDB);
+  saveTimestampDB(tsDB, timestampDbFile);
   timeline.push(newEvent);
-  saveTimeline(timeline);
+  saveTimeline(timeline, timelineFile);
   // 批注 2026-07-15：特殊事件可能包含推送正文；日志只记录长度，避免公开部署时泄漏私密内容。
   console.log(`\n已记录特殊事件 (position ${newEvent.position}, chars ${normalizeContentToText(content).length})\n`);
 }
@@ -767,13 +837,18 @@ app.post("/v1/chat/completions", async (req, reply) => {
     } catch (error) {
       return reply.code(400).send({ error: "Invalid Kelivo conversation headers" });
     }
-    const oldTimeline = loadTimeline();
+    const conversationState = kelivoSyncBinding.provided
+      ? getConversationStatePaths(kelivoSyncBinding)
+      : null;
+    const timelineFile = conversationState?.timeline_file || TIMELINE_FILE;
+    const timestampDbFile = conversationState?.timestamp_db_file || TIMESTAMP_DB_FILE;
+    const oldTimeline = loadTimeline(timelineFile);
 
-    const tsDB = loadTimestampDB();
+    const tsDB = loadTimestampDB(timestampDbFile);
     let tsDBDirty = rememberContentTimestamps(kelivoMessages, tsDB);
     // 仅为本次请求最后一条真实 user 消息补收件时间；历史消息和重复请求绝不刷新为当前时间。
     tsDBDirty = rememberLatestUserReceiveTime(kelivoMessages, tsDB, requestReceivedAt) || tsDBDirty;
-    if (tsDBDirty) saveTimestampDB(tsDB);
+    if (tsDBDirty) saveTimestampDB(tsDB, timestampDbFile);
 
     // Archive is an independent, fail-open observer. Protocol 1 is the only
     // route to a canonical user message; role/content heuristics are never an
@@ -787,8 +862,8 @@ app.post("/v1/chat/completions", async (req, reply) => {
     // 缺失 Header 的旧 Kelivo 保持完全兼容；只有真实 user 回合才更新持久化绑定。
     updateKelivoSyncContextFromChat(kelivoSyncBinding, kelivoMessages);
 
-    const finalTimeline = buildTimeline(kelivoMessages, tsDB);
-    saveTimeline(finalTimeline);
+    const finalTimeline = buildTimeline(kelivoMessages, tsDB, oldTimeline);
+    saveTimeline(finalTimeline, timelineFile);
 
     // Kelivo 发图时 content 常是数组。默认原样透传给视觉模型；
     // 如上游不支持图片，可设置 MULTIMODAL_MODE=text 退回文本占位。
@@ -994,58 +1069,101 @@ app.post("/v1/chat/completions", async (req, reply) => {
 // ========================
 app.post("/internal/wake-event", async (req, reply) => {
   try {
-    const { content, proactive } = req.body || {};
+    const { content, proactive, binding: rawBinding } = req.body || {};
     if (!content) return reply.code(400).send({ error: "content is required" });
-    appendSpecialEvent(content);
+    let binding;
+    let normalizedProactive = null;
+    try {
+      binding = normalizeWakeBinding(rawBinding);
+      if (proactive) normalizedProactive = normalizeWakeProactivePayload(proactive);
+    } catch (error) {
+      const reason = error?.code === "PROACTIVE_BODY_VALIDATION" ? error.message : "invalid_proactive_payload";
+      console.warn(JSON.stringify({ event: "proactive_validation_failed", reason }));
+      return reply.code(400).send({ error: "Invalid proactive wake event" });
+    }
+    if (normalizedProactive && (
+      normalizedProactive.binding.conversation_id !== binding.conversation_id ||
+      normalizedProactive.binding.assistant_id !== binding.assistant_id
+    )) return reply.code(400).send({ error: "Mismatched proactive binding" });
 
-    if (proactive) {
-      let normalizedProactive;
+    const conversationState = getConversationStatePaths(binding);
+    appendSpecialEvent(content, {
+      timelineFile: conversationState.timeline_file,
+      timestampDbFile: conversationState.timestamp_db_file
+    });
+
+    if (normalizedProactive) {
       try {
-        normalizedProactive = normalizeWakeProactivePayload(proactive);
-      } catch (error) {
-        console.warn(JSON.stringify({ event: "proactive_sync_skipped", reason: "invalid_proactive_payload" }));
-      }
-
-      if (normalizedProactive) {
-        const context = loadKelivoSyncContext();
-        if (!context?.conversation_id) {
-          console.log(JSON.stringify({ event: "proactive_sync_skipped", reason: "missing_conversation_binding" }));
-        } else {
-          try {
-            const event = appendProactiveEvent({
-              conversation_id: context.conversation_id,
-              assistant_id: context.assistant_id,
+        const event = appendProactiveEvent({
+              conversation_id: binding.conversation_id,
+              assistant_id: binding.assistant_id,
               title: normalizedProactive.title,
               body: normalizedProactive.body,
               source: "wake",
               push_provider: normalizedProactive.provider
             });
-            console.log(JSON.stringify({
-              event: "proactive_event_created",
-              seq: event.seq,
-              source: event.source,
-              conversation_bound: true,
-              assistant_bound: Boolean(context.assistant_id)
-            }));
-            rawChatArchive.captureProactive({
-              conversation_id: context.conversation_id,
-              assistant_id: context.assistant_id,
-              content: normalizedProactive.body,
-              message_time: normalizedProactive.sent_at,
-              observed_at: new Date(),
-              external_event_id: event.event_id,
-              metadata_json: {
-                title: normalizedProactive.title,
-                push_provider: normalizedProactive.provider
-              }
-            });
-          } catch (error) {
+        console.log(JSON.stringify({
+          event: "proactive_event_created",
+          seq: event.seq,
+          source: event.source,
+          conversation_bound: true,
+          assistant_bound: true
+        }));
+        const provenanceRequestId = normalizedProactive.provenance.request_id;
+        if (provenanceRequestId) {
+          try {
+            const updated = updateProactiveProvenance(provenanceRequestId, {
+              event_id: event.event_id,
+              archive_result: "scheduled",
+              archive_message_id: null,
+              archive_completed_at: null,
+              archive_error_code: null
+            }, { expectedEventId: null });
+            if (!updated) {
+              console.warn(JSON.stringify({ event: "proactive_provenance_event_link_missing", request_id: provenanceRequestId, event_id: event.event_id }));
+            }
+          } catch (updateError) {
             console.warn(JSON.stringify({
-              event: "proactive_event_create_failed",
-              error_category: error?.code || "storage_error"
+              event: "proactive_provenance_event_link_failed",
+              request_id: provenanceRequestId,
+              event_id: event.event_id,
+              error_category: safeArchiveErrorCode(updateError)
             }));
           }
         }
+        const archiveInput = {
+          conversation_id: binding.conversation_id,
+          assistant_id: binding.assistant_id,
+          content: normalizedProactive.body,
+          message_time: normalizedProactive.sent_at,
+          observed_at: new Date(),
+          external_event_id: event.event_id,
+          metadata_json: {
+            title: normalizedProactive.title,
+            push_provider: normalizedProactive.provider,
+            proactive_provenance: normalizedProactive.provenance
+          }
+        };
+        try {
+          Promise.resolve(rawChatArchive.captureProactive(archiveInput))
+            .then(result => {
+              updateProactiveArchiveOutcome({ requestId: provenanceRequestId, eventId: event.event_id, result });
+            })
+            .catch(error => {
+              updateProactiveArchiveOutcome({ requestId: provenanceRequestId, eventId: event.event_id, error });
+              console.warn(JSON.stringify({ event: "proactive_archive_capture_failed", error_category: safeArchiveErrorCode(error) }));
+            });
+        } catch (error) {
+          updateProactiveArchiveOutcome({ requestId: provenanceRequestId, eventId: event.event_id, error });
+          console.warn(JSON.stringify({ event: "proactive_archive_capture_failed", error_category: safeArchiveErrorCode(error) }));
+        }
+        return reply.send({ success: true, event_id: event.event_id, archive_result: "scheduled" });
+      } catch (error) {
+        console.warn(JSON.stringify({
+          event: "proactive_event_create_failed",
+          error_category: error?.code || "storage_error"
+        }));
+        return reply.code(500).send({ error: "Proactive event store unavailable" });
       }
     }
     reply.send({ success: true });

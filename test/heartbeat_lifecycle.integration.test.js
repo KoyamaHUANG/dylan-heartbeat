@@ -28,12 +28,18 @@ const { app } = require("../server");
 const { runWakeUp } = require("../wake_up");
 const { makeFingerprint, makeFingerprintStripped } = require("../timestamp_memory");
 const { isSpecialEventContent } = require("../special_events");
+const { getConversationStatePaths, saveKelivoSyncContext } = require("../kelivo_sync_context");
 
 const originalFetch = global.fetch;
 const upstreamRequests = [];
 const barkPayloads = [];
 const wakeEventRequests = [];
 const modelReplies = [];
+const wakeTarget = { conversation_id: "lifecycle-conversation", assistant_id: "ayan" };
+
+function structured(action, body = "", title = "") {
+  return JSON.stringify({ action, title, body });
+}
 
 function jsonResponse(status, body) {
   return new Response(JSON.stringify(body), {
@@ -47,17 +53,22 @@ function enqueueModelReply(content) {
 }
 
 function writeRuntimeFile(name, value) {
-  fs.writeFileSync(path.join(dataDirectory, name), JSON.stringify(value, null, 2), "utf8");
+  const state = getConversationStatePaths(wakeTarget);
+  fs.mkdirSync(state.directory, { recursive: true });
+  const filePath = name === "enhanced_messages.json" ? state.timeline_file : state.timestamp_db_file;
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf8");
 }
 
 function readRuntimeFile(name, fallback) {
-  const filePath = path.join(dataDirectory, name);
+  const state = getConversationStatePaths(wakeTarget);
+  const filePath = name === "enhanced_messages.json" ? state.timeline_file : state.timestamp_db_file;
   return fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, "utf8")) : fallback;
 }
 
 function resetRuntimeState(timeline = [], timestampDB = {}) {
   writeRuntimeFile("enhanced_messages.json", timeline);
   writeRuntimeFile("message_timestamps.json", timestampDB);
+  saveKelivoSyncContext({ ...wakeTarget, latest_user_fingerprint: "lifecycle-test" });
   fs.rmSync(path.join(dataDirectory, "diary"), { recursive: true, force: true });
 }
 
@@ -74,6 +85,10 @@ async function chat(messages) {
   const response = await app.inject({
     method: "POST",
     url: "/v1/chat/completions",
+    headers: {
+      "x-kelivo-conversation-id": wakeTarget.conversation_id,
+      "x-kelivo-assistant-id": wakeTarget.assistant_id
+    },
     payload: { model: "test-model", stream: false, messages }
   });
   assert.equal(response.statusCode, 200);
@@ -140,7 +155,7 @@ test("Gateway、wake-up、Bark、wake event 与后续聊天保持连续且上游
   setRememberedTime(user2, Date.now() - 5 * 60 * 1000);
   const barkCountBeforeWake = barkPayloads.length;
   const wakeEventCountBeforeWake = wakeEventRequests.length;
-  enqueueModelReply("想你了，在忙吗？");
+  enqueueModelReply(structured("send", "想你了，在忙吗？"));
   await runWakeUp();
   assert.equal(barkPayloads.length, barkCountBeforeWake + 1);
   assert.equal(wakeEventRequests.length, wakeEventCountBeforeWake + 1);
@@ -204,26 +219,26 @@ test("Gateway、wake-up、Bark、wake event 与后续聊天保持连续且上游
   assert.ok(firstTimedUserIndex < timedEventIndex && timedEventIndex < secondTimedUserIndex);
   assert.equal(timedRequest.messages.at(-1).role, "user");
 
-  // G. [NO_ACTION] 仍记录事件但不 Bark；下一次聊天不产生 assistant prefill。
+  // G. action=skip 不记录 event，也不 Bark；下一次聊天不产生 assistant prefill。
   const silentUser = { role: "user", content: "静默 wake 的用户消息" };
   resetRuntimeState([system, silentUser], {});
   setRememberedTime(silentUser, Date.now() - 5 * 60 * 1000);
   const barkCountBeforeSilent = barkPayloads.length;
-  enqueueModelReply("[NO_ACTION]");
+  enqueueModelReply(structured("skip"));
   await runWakeUp();
   assert.equal(barkPayloads.length, barkCountBeforeSilent);
-  assert.ok(latestSpecialEvent());
+  assert.equal(latestSpecialEvent(), undefined);
   const silentReturnRequest = await chat([system, silentUser, { role: "user", content: "静默后继续聊天" }]);
   assert.equal(silentReturnRequest.messages.at(-1).role, "user");
 
-  // H. [DIARY] 在启用时写入、禁用时跳过；两种结果之后均可继续普通聊天。
+  // H. 旧 DIARY/free-text 输出不再满足 wake 契约，不能写入日记或发送。
   const diaryUser = { role: "user", content: "写日记的用户消息" };
   resetRuntimeState([system, diaryUser], {});
   setRememberedTime(diaryUser, Date.now() - 5 * 60 * 1000);
   process.env.DIARY_ENABLED = "true";
   enqueueModelReply("[DIARY]测试日记[/DIARY]\n[NO_ACTION]");
   await runWakeUp();
-  assert.equal(fs.readdirSync(path.join(dataDirectory, "diary")).length, 1);
+  assert.equal(fs.existsSync(path.join(dataDirectory, "diary")), false);
   const diaryReturnRequest = await chat([system, diaryUser, { role: "user", content: "日记后继续聊天" }]);
   assert.equal(diaryReturnRequest.messages.at(-1).role, "user");
 
@@ -241,8 +256,8 @@ test("Gateway、wake-up、Bark、wake event 与后续聊天保持连续且上游
   const repeatedWakeUser = { role: "user", content: "连续唤醒的用户消息" };
   resetRuntimeState([system, repeatedWakeUser], {});
   setRememberedTime(repeatedWakeUser, Date.now() - 5 * 60 * 1000);
-  enqueueModelReply("第一次连续唤醒");
-  enqueueModelReply("第二次连续唤醒");
+  enqueueModelReply(structured("send", "第一次连续唤醒"));
+  enqueueModelReply(structured("send", "第二次连续唤醒"));
   await runWakeUp();
   await runWakeUp();
   const repeatedEvents = readRuntimeFile("enhanced_messages.json", []).filter(message => isSpecialEventContent(message.content));
