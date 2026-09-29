@@ -976,8 +976,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
     const response = eligibleForHistoryTool(body, kelivoSyncBinding, historyToolEnabled)
       ? await completeWithHistoryTool({
         body, messages: upstreamMessages, binding: kelivoSyncBinding,
-        query: historyReader.query, fetchUpstream,
-        onToolPhase: payload => archiveCapture.archiveAssistant(payload, { observedAt: new Date() })
+        query: historyReader.query, fetchUpstream
       })
       : await fetchUpstream((() => {
         const upstreamBody = { ...body, messages: upstreamMessages };

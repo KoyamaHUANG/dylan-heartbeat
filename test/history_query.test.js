@@ -91,6 +91,7 @@ test('read-only mock client returns stable total and a signed second page',async
   assert.equal(released,2);
   assert.equal(statements.filter(sql=>sql==='BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY').length,2);
   assert.equal(statements.filter(sql=>sql==='ROLLBACK').length,2);
+  for(const sql of statements)assert.match(sql,/^(BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY|SET LOCAL |SELECT |ROLLBACK$)/);
 });
 
 test('authenticated exact-ID HTTP lookup reports unavailable on an empty result',async()=>{

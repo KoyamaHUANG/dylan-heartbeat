@@ -26,8 +26,17 @@ test.after(async()=>{
   fs.rmSync(dataDirectory,{recursive:true,force:true});
 });
 
-test('Gateway keeps a Kelivo tool while completing a bound history lookup and final answer',async()=>{
+test('Gateway keeps a Kelivo tool while archiving one ordinary turn around a bound history lookup',async t=>{
   const requests=[],queries=[];
+  const captures=[];
+  t.mock.method(rawChatArchive,'captureChatRequest',input=>{
+    const capture={input,assistants:[]};
+    captures.push(capture);
+    return {
+      archiveAssistant:payload=>{capture.assistants.push(payload);return Promise.resolve({});},
+      archiveAssistantTerminal:()=>Promise.resolve({})
+    };
+  });
   historyReader.query=async raw=>{
     queries.push(raw);
     return {date:raw.date,timezone:'Asia/Shanghai',total:1,next_cursor:null,messages:[{
@@ -65,8 +74,17 @@ test('Gateway keeps a Kelivo tool while completing a bound history lookup and fi
   assert.equal(requests.length,2);
   assert.deepEqual(requests[0].tools.map(tool=>tool.function.name),['kelivo_existing_tool',HISTORY_TOOL_NAME]);
   assert.deepEqual(requests[1].tools.map(tool=>tool.function.name),['kelivo_existing_tool',HISTORY_TOOL_NAME]);
-  assert.equal(JSON.parse(requests[1].messages.at(-1).content).messages[0].content,'模拟历史消息');
+  assert.equal(requests[1].messages.at(-1).role,'tool');
+  assert.equal(requests[1].messages.filter(message=>message.role==='user').length,1);
+  const evidence=JSON.parse(requests[1].messages.at(-1).content).messages[0];
+  assert.deepEqual([evidence.id,evidence.original_message_id,evidence.role,evidence.message_time,evidence.source],
+    ['history-mock-1','original-mock-1','user','2026-08-20T00:00:00.000000Z','kelivo_history_import']);
+  assert.equal(evidence.content,'模拟历史消息');
   assert.deepEqual(queries,[{assistant_id:'ayan',conversation_id:'conversation-A',date:'2026-08-20',limit:20}]);
+  assert.equal(captures.length,1);
+  assert.equal(captures[0].input.client_user_message_id,'message-mock-1');
+  assert.equal(captures[0].assistants.length,1);
+  assert.match(captures[0].assistants[0].content,/我查到一条模拟历史消息/);
 });
 
 test('Gateway passes an existing Kelivo tool call back to the client without a history lookup',async()=>{
@@ -98,6 +116,48 @@ test('Gateway passes an existing Kelivo tool call back to the client without a h
   assert.equal(requests,1);
   assert.match(response.body,/kelivo_existing_tool/);
   assert.match(response.body,/data: \[DONE\]/);
+});
+
+test('disabled history tool keeps the ordinary chat archive path and client tools',async t=>{
+  const previousFlag=process.env.AYAN_HISTORY_TOOL_ENABLED;
+  const captures=[];
+  process.env.AYAN_HISTORY_TOOL_ENABLED='false';
+  t.mock.method(rawChatArchive,'captureChatRequest',input=>{
+    const capture={input,assistants:[]};
+    captures.push(capture);
+    return {
+      archiveAssistant:payload=>{capture.assistants.push(payload);return Promise.resolve({});},
+      archiveAssistantTerminal:()=>Promise.resolve({})
+    };
+  });
+  historyReader.query=async()=>{throw new Error('disabled history reader must not run');};
+  global.fetch=async(url,options)=>{
+    assert.equal(String(url),process.env.TARGET_API_URL);
+    const request=JSON.parse(options.body);
+    assert.deepEqual(request.tools.map(tool=>tool.function.name),['kelivo_existing_tool']);
+    return new Response(JSON.stringify({choices:[{message:{role:'assistant',content:'普通回复'}}]}),{
+      status:200,headers:{'content-type':'application/json'}
+    });
+  };
+  try{
+    const response=await app.inject({
+      method:'POST',url:'/v1/chat/completions',remoteAddress:'10.0.0.8',
+      headers:{authorization:'Bearer mock-gateway-key','x-kelivo-conversation-id':'conversation-A',
+        'x-kelivo-assistant-id':'ayan','x-kelivo-archive-protocol':'1',
+        'x-kelivo-request-id':'request-mock-disabled','x-kelivo-user-message-id':'message-mock-disabled'},
+      payload:{model:'mock-model',stream:false,messages:[{role:'user',content:'普通聊天'}],
+        tools:[{type:'function',function:{name:'kelivo_existing_tool',parameters:{type:'object'}}}],
+        _kelivo_archive:{version:1,kind:'user_send',conversation_id:'conversation-A',assistant_id:'ayan',
+          request_id:'request-mock-disabled',user_message_id:'message-mock-disabled',user_message_index:0,
+          user_message_time:'2026-08-20T00:00:02.000Z',
+          user_archive_content:{format:'kelivo_chat_message_parts_v1',parts:[{type:'text',text:'普通聊天'}]}}}
+    });
+    assert.equal(response.statusCode,200);
+    assert.equal(captures.length,1);
+    assert.equal(captures[0].input.client_user_message_id,'message-mock-disabled');
+    assert.equal(captures[0].assistants.length,1);
+    assert.equal(captures[0].assistants[0].content,'普通回复');
+  }finally{process.env.AYAN_HISTORY_TOOL_ENABLED=previousFlag;}
 });
 
 test('Gateway keeps the existing stream error response path with history tool disabled',async()=>{

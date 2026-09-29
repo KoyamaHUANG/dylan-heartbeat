@@ -94,7 +94,7 @@ function completionResponse(payload, original, wantsStream) {
   });
 }
 
-async function completeWithHistoryTool({body, messages, binding, query, fetchUpstream, onToolPhase}) {
+async function completeWithHistoryTool({body, messages, binding, query, fetchUpstream}) {
   let workingMessages = [HISTORY_TRUST_RULE,...messages];
   const seenQueries = new Set();
   const clientTools = body.tools || [];
@@ -136,7 +136,6 @@ async function completeWithHistoryTool({body, messages, binding, query, fetchUps
       result = await query(argumentsValue);
     } catch { return unavailableResponse(); }
     historyUsed = true;
-    onToolPhase?.({content:'',intermediate:true,metadata_json:{structured_assistant:{tool_calls:calls}}});
     if (!Array.isArray(result.messages) || !Number.isSafeInteger(result.total) || result.total < 0)
       return unavailableResponse();
     if (result.total === 0 || result.messages.length === 0) {

@@ -40,7 +40,7 @@ test('model arguments cannot choose another assistant or conversation',()=>{
 });
 
 test('mock model tool call reads only the bound conversation and returns a final streaming answer',async()=>{
-  const requests=[], phases=[], queries=[];
+  const requests=[], queries=[];
   const response=await completeWithHistoryTool({
     body,messages:body.messages,binding,
     query:async raw=>{
@@ -55,8 +55,7 @@ test('mock model tool call reads only the bound conversation and returns a final
       return requests.length===1
         ?completion({role:'assistant',tool_calls:[call('{"date":"2026-08-20"}')]})
         :completion({role:'assistant',content:'那天你说过喜欢拿铁。'});
-    },
-    onToolPhase:phase=>phases.push(phase)
+    }
   });
   assert.equal(requests.length,2);
   assert.equal(requests[0].stream,false);
@@ -66,8 +65,6 @@ test('mock model tool call reads only the bound conversation and returns a final
   assert.equal(requests[1].messages.at(-1).role,'tool');
   assert.equal(JSON.parse(requests[1].messages.at(-1).content).messages[0].content,'我喜欢拿铁。');
   assert.equal(requests[1].tools[0].function.name,HISTORY_TOOL_NAME);
-  assert.equal(phases.length,1);
-  assert.equal(phases[0].intermediate,true);
   assert.equal(response.headers.get('content-type'),'text/event-stream');
   const output=await response.text();
   assert.match(output,/那天你说过喜欢拿铁/);
