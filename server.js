@@ -20,6 +20,8 @@ const {
 const { authorizeArchiveRequest } = require("./archive/archive_auth");
 const { SseAssistantCollector } = require("./archive/archive_stream");
 const { registerArchiveRoutes } = require("./archive/archive_routes");
+const { registerHistoryRoutes } = require("./archive/history_query");
+const { eligibleForHistoryTool, completeWithHistoryTool } = require("./archive/history_tool");
 const { RawChatArchiveService, buildChatCaptureInput } = require("./archive/archive_sync");
 const { validateArchiveIdentity } = require("./archive/archive_protocol");
 const {
@@ -760,6 +762,7 @@ app.get("/v1/models", async (req, reply) => {
 });
 
 registerArchiveRoutes(app, { archiveService: rawChatArchive, timeZone: TIME_ZONE });
+const historyReader = registerHistoryRoutes(app, { timeZone: TIME_ZONE, requireBothForHttp: true });
 
 app.addHook("onClose", async () => {
   await rawChatArchive.close();
@@ -959,18 +962,28 @@ app.post("/v1/chat/completions", async (req, reply) => {
     const requestedStream = body?.stream === true;
 
     // 请求模型
-    const response = await fetch(TARGET_API_URL, {
+    const fetchUpstream = upstreamBody => fetch(TARGET_API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${process.env.TARGET_API_KEY}`
       },
-      body: JSON.stringify((() => {
+      body: JSON.stringify(upstreamBody)
+    });
+    const historyToolEnabled = readBooleanEnv("AYAN_HISTORY_TOOL_ENABLED", false) &&
+      readBooleanEnv("ARCHIVE_ENABLED", false) && Boolean(process.env.ARCHIVE_DATABASE_URL && process.env.ARCHIVE_API_KEY) &&
+      archiveProtocol.valid && archiveProtocol.identity?.kind === "user_send";
+    const response = eligibleForHistoryTool(body, kelivoSyncBinding, historyToolEnabled)
+      ? await completeWithHistoryTool({
+        body, messages: upstreamMessages, binding: kelivoSyncBinding,
+        query: historyReader.query, fetchUpstream,
+        onToolPhase: payload => archiveCapture.archiveAssistant(payload, { observedAt: new Date() })
+      })
+      : await fetchUpstream((() => {
         const upstreamBody = { ...body, messages: upstreamMessages };
         delete upstreamBody._kelivo_archive;
         return upstreamBody;
-      })())
-    });
+      })());
 
     const upstreamContentType = response.headers.get("content-type") || "";
     const shouldStreamResponse = requestedStream || upstreamContentType.includes("text/event-stream");
@@ -2197,6 +2210,7 @@ if (require.main === module) startServer();
 
 module.exports = {
   app,
+  historyReader,
   rawChatArchive,
   extractTimestamp,
   extractTimestampWithMemory,
