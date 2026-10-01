@@ -189,3 +189,91 @@ test('Gateway keeps the existing stream error response path with history tool di
     process.env.AYAN_HISTORY_TOOL_ENABLED=previousFlag;
   }
 });
+
+test('Gateway mixed response after a miss preserves client call association and replaces unsupported content',async t=>{
+  let requests=0,queries=0;
+  const archived=[];
+  t.mock.method(rawChatArchive,'captureChatRequest',()=>({
+    archiveAssistant:payload=>{archived.push(payload);return Promise.resolve({});},
+    archiveAssistantTerminal:()=>Promise.resolve({})
+  }));
+  historyReader.query=async()=>{queries++;return {total:0,messages:[],next_cursor:null};};
+  const clientCall={id:'mixed-client-call',type:'function',function:{name:'kelivo_existing_tool',arguments:'{"query":"拿铁"}'}};
+  global.fetch=async()=>{
+    const message=++requests===1?{role:'assistant',tool_calls:[{id:'mixed-history-call',type:'function',
+      function:{name:HISTORY_TOOL_NAME,arguments:'{"keyword":"拿铁"}'}}]}
+      :{role:'assistant',content:'历史记录不存在。',tool_calls:[clientCall]};
+    return new Response(JSON.stringify({choices:[{index:0,message,finish_reason:'tool_calls'}]}),{
+      status:200,headers:{'content-type':'application/json'}});
+  };
+  const response=await app.inject({method:'POST',url:'/v1/chat/completions',remoteAddress:'10.0.0.8',
+    headers:{authorization:'Bearer mock-gateway-key','x-kelivo-conversation-id':'conversation-A',
+      'x-kelivo-assistant-id':'ayan','x-kelivo-archive-protocol':'1',
+      'x-kelivo-request-id':'mixed-request','x-kelivo-user-message-id':'mixed-user'},
+    payload:{model:'mock-model',stream:false,messages:[{role:'user',content:'查拿铁'}],
+      tools:[{type:'function',function:{name:'kelivo_existing_tool',parameters:{type:'object'}}}],
+      _kelivo_archive:{version:1,kind:'user_send',conversation_id:'conversation-A',assistant_id:'ayan',
+        request_id:'mixed-request',user_message_id:'mixed-user',user_message_index:0,
+        user_message_time:'2026-08-20T00:00:00Z',
+        user_archive_content:{format:'kelivo_chat_message_parts_v1',parts:[{type:'text',text:'查拿铁'}]}}}
+  });
+  assert.equal(response.statusCode,200);
+  const choice=response.json().choices[0];
+  assert.deepEqual(choice.message.tool_calls,[clientCall]);
+  assert.equal(choice.finish_reason,'tool_calls');
+  assert.match(choice.message.content,/本次检索未找到.*不代表历史记录不存在/);
+  assert.equal(requests,2);
+  assert.equal(queries,1);
+  assert.ok(archived.length<=1);
+  for(const payload of archived)assert.match(payload.content,/本次检索未找到/);
+});
+
+test('Gateway retries a keyword miss in the bound date scope and archives only the final sourced answer',async t=>{
+  const requests=[],queries=[],captures=[];
+  t.mock.method(rawChatArchive,'captureChatRequest',()=>{
+    const answers=[];captures.push(answers);
+    return {archiveAssistant:payload=>{answers.push(payload);return Promise.resolve({});},
+      archiveAssistantTerminal:()=>Promise.resolve({})};
+  });
+  historyReader.query=async raw=>{
+    queries.push(raw);
+    return queries.length===1?{total:0,messages:[],next_cursor:null}:{total:1,next_cursor:null,messages:[{
+      storage:'history',id:'retry-gateway-hit',original_message_id:'retry-original',role:'user',
+      content_text:'模拟拿铁偏好',message_time:'2026-08-20T00:00:00Z',source:'kelivo_history_import'
+    }]};
+  };
+  global.fetch=async(url,options)=>{
+    assert.equal(String(url),process.env.TARGET_API_URL);
+    const request=JSON.parse(options.body);requests.push(request);
+    const message=requests.length<3?{role:'assistant',tool_calls:[{id:`retry-${requests.length}`,type:'function',
+      function:{name:HISTORY_TOOL_NAME,arguments:JSON.stringify({date:'2026-08-20',keyword:requests.length===1?'拿铁咖啡':'拿铁'})}}]}
+      :{role:'assistant',content:'本次查到模拟拿铁偏好。'};
+    return new Response(JSON.stringify({choices:[{message}]}),{status:200,headers:{'content-type':'application/json'}});
+  };
+  const response=await app.inject({method:'POST',url:'/v1/chat/completions',remoteAddress:'10.0.0.8',
+    headers:{authorization:'Bearer mock-gateway-key','x-kelivo-conversation-id':'conversation-A',
+      'x-kelivo-assistant-id':'ayan','x-kelivo-archive-protocol':'1',
+      'x-kelivo-request-id':'retry-request','x-kelivo-user-message-id':'retry-user'},
+    payload:{model:'mock-model',stream:true,messages:[{role:'user',content:'查那天的拿铁偏好'}],
+      tools:[{type:'function',function:{name:'kelivo_existing_tool',parameters:{type:'object'}}}],
+      _kelivo_archive:{version:1,kind:'user_send',conversation_id:'conversation-A',assistant_id:'ayan',
+        request_id:'retry-request',user_message_id:'retry-user',user_message_index:0,
+        user_message_time:'2026-08-20T00:00:00Z',
+        user_archive_content:{format:'kelivo_chat_message_parts_v1',parts:[{type:'text',text:'查那天的拿铁偏好'}]}}}
+  });
+  assert.equal(response.statusCode,200);
+  assert.equal(requests.length,3);
+  assert.deepEqual(queries.map(q=>[q.assistant_id,q.conversation_id,q.date,q.keyword]),[
+    ['ayan','conversation-A','2026-08-20','拿铁咖啡'],['ayan','conversation-A','2026-08-20','拿铁']
+  ]);
+  assert.equal(JSON.parse(requests[1].messages.at(-1).content).lookup_status,'not_found');
+  for(const request of requests){
+    assert.deepEqual(request.tools.map(tool=>tool.function.name),['kelivo_existing_tool',HISTORY_TOOL_NAME]);
+    assert.equal(request._kelivo_archive,undefined);
+  }
+  assert.equal(captures.length,1);
+  assert.equal(captures[0].length,1);
+  assert.equal(captures[0][0].content,'本次查到模拟拿铁偏好。');
+  assert.match(response.body,/本次查到模拟拿铁偏好/);
+  assert.match(response.body,/data: \[DONE\]/);
+});

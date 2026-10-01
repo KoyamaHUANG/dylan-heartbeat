@@ -152,17 +152,19 @@ test('unexpected or failed tool calls stop before a second model request',async(
   assert.equal(requests,2);
 });
 
-test('missing original ID and empty keyword results return an explicit unavailable answer without model invention',async()=>{
-  for(const argumentsText of ['{"original_message_id":"missing"}','{"keyword":"absent"}']){
+test('missing original ID and date-only misses stop without claiming history does not exist',async()=>{
+  for(const argumentsText of ['{"original_message_id":"missing"}','{"date":"2026-08-20"}']){
     let requests=0;
     const response=await completeWithHistoryTool({
       body,messages:body.messages,binding,
-      query:async()=>({date:null,timezone:'Asia/Shanghai',total:0,next_cursor:null,messages:[],lookup_status:'unavailable'}),
+      query:async()=>({date:null,timezone:'Asia/Shanghai',total:0,next_cursor:null,messages:[],
+        ...(argumentsText.includes('original_message_id')?{lookup_status:'unavailable'}:{})}),
       fetchUpstream:async()=>{requests++;return completion({role:'assistant',tool_calls:[call(argumentsText)]});}
     });
     assert.equal(requests,1);
     const output=await response.text();
     assert.match(output,/无法确认/);
+    assert.match(output,/不代表历史记录不存在/);
     assert.doesNotMatch(output,/tool_calls/);
   }
 });
@@ -224,4 +226,217 @@ test('existing Kelivo tool calls pass through while the history tool remains reg
   assert.deepEqual(requests[0].tools[0],existing);
   assert.equal(requests[0].tools[1].function.name,HISTORY_TOOL_NAME);
   assert.match(await response.text(),/kelivo_lookup/);
+});
+
+const emptyHistory = () => ({total:0,messages:[],next_cursor:null});
+test('mixed client-tool response after a miss replaces prose and preserves calls in JSON and SSE',async()=>{
+  for(const stream of [false,true]){
+    const clientCalls=['first','second'].map(id=>({id:`client-${id}`,type:'function',
+      function:{name:'kelivo_lookup',arguments:JSON.stringify({key:id})}}));
+    let requests=0,queries=0;
+    const response=await completeWithHistoryTool({
+      body:{...body,stream,tools:[{type:'function',function:{name:'kelivo_lookup'}}]},messages:body.messages,binding,
+      query:async()=>{queries++;return emptyHistory();},
+      fetchUpstream:async()=>++requests===1
+        ?completion({role:'assistant',tool_calls:[call('{"keyword":"拿铁"}')]})
+        :completion({role:'assistant',content:'历史记录不存在。',tool_calls:clientCalls})
+    });
+    assert.equal(response.status,200);
+    assert.equal(requests,2);
+    assert.equal(queries,1);
+    const raw=await response.text();
+    const payload=stream?raw.split('\n').filter(line=>line.startsWith('data: {')).map(line=>JSON.parse(line.slice(6))):JSON.parse(raw);
+    const message=stream?payload[0].choices[0].delta:payload.choices[0].message;
+    assert.deepEqual(message.tool_calls,clientCalls);
+    assert.match(message.content,/本次检索未找到.*不代表历史记录不存在/);
+    assert.equal(stream?payload.at(-1).choices[0].finish_reason:payload.choices[0].finish_reason,'tool_calls');
+    assert.doesNotMatch(message.content,/^历史记录不存在/);
+  }
+});
+
+test('unknown client tool after a miss remains an error',async()=>{
+  let requests=0;
+  const response=await completeWithHistoryTool({body,messages:body.messages,binding,
+    query:async()=>emptyHistory(),
+    fetchUpstream:async()=>++requests===1
+      ?completion({role:'assistant',tool_calls:[call('{"keyword":"拿铁"}')]})
+      :completion({role:'assistant',content:'历史记录不存在。',tool_calls:[{
+        id:'unknown',type:'function',function:{name:'unknown_tool',arguments:'{}'}
+      }]})
+  });
+  assert.equal(response.status,503);
+});
+const foundHistory = (next_cursor=null) => ({total:1,next_cursor,messages:[{
+  storage:'history',id:'retry-hit',role:'user',content_text:'我喜欢拿铁。',
+  message_time:'2026-08-20T03:12:08Z',source:'kelivo_history_import'
+}]});
+
+test('zero-hit keyword result allows a scoped retry, then reuses cursor and time-window context queries',async()=>{
+  const requests=[],queries=[];
+  const args=[
+    {date:'2026-08-20',keyword:'拿铁咖啡'},
+    {date:'2026-08-20',keyword:'拿铁'},
+    {date:'2026-08-20',keyword:'拿铁',cursor:'signed-cursor'},
+    {start:'2026-08-20T03:00:00Z',end:'2026-08-20T03:30:00Z'}
+  ];
+  const response=await completeWithHistoryTool({body,messages:body.messages,binding,
+    query:async raw=>{queries.push(raw);return queries.length===1?emptyHistory():foundHistory(queries.length===2?'signed-cursor':null);},
+    fetchUpstream:async request=>{
+      requests.push(request);
+      return requests.length<=args.length
+        ?completion({role:'assistant',tool_calls:[call(JSON.stringify(args[requests.length-1]))]})
+        :completion({role:'assistant',content:'那天你说喜欢拿铁。'});
+    }
+  });
+  assert.equal(response.status,200);
+  assert.equal(queries.length,4);
+  const miss=JSON.parse(requests[1].messages.at(-1).content);
+  assert.equal(miss.lookup_status,'not_found');
+  assert.deepEqual(miss.keyword_retry,{remaining_attempts:2,scope:{date:'2026-08-20'}});
+  assert.deepEqual(miss.messages,[]);
+  assert.equal(queries[2].cursor,'signed-cursor');
+  assert.equal(queries[3].start,args[3].start);
+  for(const query of queries){
+    assert.equal(query.assistant_id,binding.assistant_id);
+    assert.equal(query.conversation_id,binding.conversation_id);
+  }
+  assert.match(await response.text(),/喜欢拿铁/);
+});
+
+test('keyword retries stop after two extra searches in streaming and JSON responses',async()=>{
+  for(const stream of [true,false]){
+    let requests=0,queries=0;
+    const response=await completeWithHistoryTool({body:{...body,stream},messages:body.messages,binding,
+      query:async()=>{queries++;return emptyHistory();},
+      fetchUpstream:async()=>completion({role:'assistant',tool_calls:[call(JSON.stringify({keyword:['拿铁咖啡','拿铁','咖啡','coffee'][requests++]}))]})
+    });
+    assert.equal(response.status,200);
+    assert.equal(requests,3);
+    assert.equal(queries,3);
+    const output=await response.text();
+    assert.match(output,/本次检索未找到/);
+    assert.match(output,/不代表历史记录不存在/);
+    assert.doesNotMatch(output,/tool_calls/);
+  }
+});
+
+test('retry cannot widen date/time scope, remove keywords, use a cursor, or repeat a normalized keyword',async()=>{
+  const initial={start:'2026-08-20T00:00:00Z',end:'2026-08-21T00:00:00Z',keyword:'Coffee'};
+  for(const retry of [
+    {...initial,keyword:' coffee ',limit:1},
+    {...initial,keyword:'拿铁',start:'2026-08-19T00:00:00Z'},
+    {...initial,keyword:'拿铁',end:'2026-08-22T00:00:00Z'},
+    {keyword:'拿铁'},
+    {date:'2026-08-20',keyword:'拿铁'},
+    {start:initial.start,end:initial.end},
+    {...initial,keyword:'拿铁',cursor:'unexpected'},
+    {...initial,keyword:'拿铁',original_message_id:'other'}
+  ]){
+    let requests=0,queries=0;
+    const response=await completeWithHistoryTool({body,messages:body.messages,binding,
+      query:async()=>{queries++;return emptyHistory();},
+      fetchUpstream:async()=>completion({role:'assistant',tool_calls:[call(JSON.stringify(requests++===0?initial:retry))]})
+    });
+    assert.equal(queries,1);
+    assert.equal(response.status,200);
+    assert.match(await response.text(),/本次检索未找到/);
+  }
+});
+
+test('retry identity injection and query failures remain errors, not normal misses',async()=>{
+  for(const failure of ['assistant_id','conversation_id','database','unavailable','malformed']){
+    let requests=0,queries=0;
+    const response=await completeWithHistoryTool({body,messages:body.messages,binding,
+      query:async()=>{
+        if(++queries===1)return emptyHistory();
+        if(failure==='database')throw new Error('database offline');
+        if(failure==='unavailable')return {...emptyHistory(),lookup_status:'unavailable'};
+        return {total:0,messages:null};
+      },
+      fetchUpstream:async()=>completion({role:'assistant',tool_calls:[call(JSON.stringify(
+        requests++===0?{keyword:'拿铁咖啡'}:{keyword:'拿铁',...(['assistant_id','conversation_id'].includes(failure)?{[failure]:'other'}:{})}
+      ))]})
+    });
+    assert.equal(response.status,503);
+    assert.equal(queries,['assistant_id','conversation_id'].includes(failure)?1:2);
+    assert.match(await response.text(),/History lookup unavailable/);
+  }
+});
+
+test('a model ending after a miss cannot assert that history never existed',async()=>{
+  let requests=0;
+  const response=await completeWithHistoryTool({body,messages:body.messages,binding,
+    query:async()=>emptyHistory(),
+    fetchUpstream:async()=>++requests===1
+      ?completion({role:'assistant',tool_calls:[call('{"keyword":"拿铁"}')]})
+      :completion({role:'assistant',content:'历史记录不存在。'})
+  });
+  assert.equal(requests,2);
+  assert.match(await response.text(),/本次检索未找到.*不代表历史记录不存在/);
+});
+
+test('entire turn never executes more than ten history queries including retries and context pages',async()=>{
+  let requests=0,queries=0;
+  const response=await completeWithHistoryTool({body,messages:body.messages,binding,
+    query:async()=>++queries===1?emptyHistory():foundHistory('next'),
+    fetchUpstream:async()=>{
+      requests++;
+      return completion({role:'assistant',tool_calls:[call(JSON.stringify(
+        requests===1?{keyword:'拿铁咖啡'}:requests===2?{keyword:'拿铁'}:{keyword:'拿铁',cursor:`page-${requests}`}
+      ))]});
+    }
+  });
+  assert.equal(queries,10);
+  assert.equal(requests,11);
+  assert.equal(response.status,503);
+});
+
+test('zero hit near the turn limit cannot allocate retries beyond the remaining query budget',async()=>{
+  let requests=0,queries=0;
+  const responses=[];
+  const response=await completeWithHistoryTool({body,messages:body.messages,binding,
+    query:async()=>++queries<9?foundHistory():emptyHistory(),
+    fetchUpstream:async request=>{
+      if(requests)responses.push(JSON.parse(request.messages.at(-1).content));
+      requests++;
+      return completion({role:'assistant',tool_calls:[call(JSON.stringify({keyword:`keyword-${requests}`}))]});
+    }
+  });
+  assert.equal(queries,10);
+  assert.equal(requests,10);
+  assert.equal(responses.at(-1).keyword_retry.remaining_attempts,1);
+  assert.equal(response.status,200);
+  assert.match(await response.text(),/本次检索未找到/);
+});
+
+test('two-retry budget is shared across multiple zero-hit sequences in one turn',async()=>{
+  let requests=0,queries=0;
+  const response=await completeWithHistoryTool({body,messages:body.messages,binding,
+    query:async()=>++queries===3?foundHistory():emptyHistory(),
+    fetchUpstream:async()=>completion({role:'assistant',tool_calls:[call(JSON.stringify({keyword:`keyword-${++requests}`}))]})
+  });
+  // Two retries found a hit on query three; the next independent miss cannot
+  // restart the retry budget, even though the overall ten-call budget remains.
+  assert.equal(queries,4);
+  assert.equal(requests,4);
+  assert.equal(response.status,200);
+  assert.match(await response.text(),/本次检索未找到/);
+});
+
+test('a valid time-range retry preserves both bounds',async()=>{
+  let requests=0;
+  const queries=[];
+  const range={start:'2026-08-20T00:00:00+08:00',end:'2026-08-21T00:00:00+08:00'};
+  const response=await completeWithHistoryTool({body,messages:body.messages,binding,
+    query:async raw=>{queries.push(raw);return queries.length===1?emptyHistory():foundHistory();},
+    fetchUpstream:async()=>{
+      requests++;
+      return requests<3?completion({role:'assistant',tool_calls:[call(JSON.stringify({...range,keyword:requests===1?'拿铁咖啡':'拿铁'}))]})
+        :completion({role:'assistant',content:'有来源的答复。'});
+    }
+  });
+  assert.equal(queries.length,2);
+  assert.equal(queries[1].start,range.start);
+  assert.equal(queries[1].end,range.end);
+  assert.match(await response.text(),/有来源的答复/);
 });
