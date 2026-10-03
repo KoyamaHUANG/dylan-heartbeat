@@ -43,9 +43,54 @@ test('query failure is distinguishable from a model response with no history cal
   const response=await completeWithHistoryTool({body,messages:body.messages,binding,log:event=>events.push(event),
     query:async()=>{throw new Error('private database details');},
     fetchUpstream:async()=>completion({role:'assistant',tool_calls:[call('{"keyword":"private-keyword"}')]})});
-  assert.equal(response.status,503);
-  assert.deepEqual(events.slice(-2).map(event=>event.stage),['query_failed','unavailable']);
+  assert.equal(response.status,200);
+  assert.ok(events.some(event=>event.stage==='query_failed'));
+  assert.ok(events.some(event=>event.stage==='tool_result_queued' && event.lookup_status==='error'));
   assert.doesNotMatch(JSON.stringify(events),/private/);
+});
+
+test('date miss and query exception reach the model as distinct statuses without leaking errors',async()=>{
+  for(const error of [false,true]){
+    const requests=[];
+    const response=await completeWithHistoryTool({body,messages:body.messages,binding,
+      query:async()=>{if(error)throw new Error('secret database URL');return {total:0,messages:[],next_cursor:null};},
+      fetchUpstream:async request=>{
+        requests.push(request);
+        return requests.length===1?completion({role:'assistant',tool_calls:[call('{"date":"2026-07-07"}')]})
+          :completion({role:'assistant',content:'之前的历史是编造的，这天根本不存在。'});
+      }});
+    assert.equal(requests.length,2);
+    assert.equal(requests[1].tool_choice,'none');
+    const receipt=JSON.parse(requests[1].messages.at(-1).content);
+    assert.equal(receipt.lookup_status,error?'error':'not_found');
+    assert.equal(requests[1].messages.at(-1).tool_call_id,'call-history-1');
+    assert.doesNotMatch(JSON.stringify(receipt),/secret/);
+    if(error){assert.equal(receipt.total,undefined);assert.equal(receipt.error.code,'HISTORY_QUERY_FAILED');}
+    else assert.equal(receipt.total,0);
+    assert.doesNotMatch(await response.text(),/根本不存在|历史是编造的/);
+  }
+});
+
+test('tool declaration and authoritative status survive large contexts and model tool denial',async()=>{
+  const messages=[...body.messages,{role:'assistant',content:'x'.repeat(80000)}];
+  const response=await completeWithHistoryTool({body,messages,binding,
+    query:async()=>assert.fail('model did not call'),
+    fetchUpstream:async request=>{
+      assert.ok(request.tools.some(tool=>tool.function.name===HISTORY_TOOL_NAME));
+      assert.ok(request.messages.some(message=>/registered and available/.test(message.content)));
+      return completion({role:'assistant',content:'我没有 ayan_search_chat_history 工具。'});
+    }});
+  assert.match(await response.text(),/本次请求已提供/);
+});
+
+test('terminal status upstream failure is not misreported as a normal zero-hit answer',async()=>{
+  let requests=0;
+  const response=await completeWithHistoryTool({body,messages:body.messages,binding,
+    query:async()=>({total:0,messages:[],next_cursor:null}),
+    fetchUpstream:async()=>++requests===1?completion({role:'assistant',tool_calls:[call('{"date":"2026-07-07"}')]})
+      :new Response('{}',{status:502})});
+  assert.equal(response.status,503);
+  assert.equal(requests,2);
 });
 
 test('history tool is opt-in and preserves existing client tool contracts',()=>{
@@ -171,7 +216,7 @@ test('keyword hit and exact original-ID hit return source-backed records to the 
   }
 });
 
-test('unexpected or failed tool calls stop before a second model request',async()=>{
+test('invalid mixed calls stop and query failures deliver a truthful status to the model',async()=>{
   let requests=0;
   const invalid=await completeWithHistoryTool({
     body,messages:body.messages,binding,
@@ -185,8 +230,9 @@ test('unexpected or failed tool calls stop before a second model request',async(
     query:async()=>{throw new Error('database offline');},
     fetchUpstream:async()=>{requests++;return completion({role:'assistant',tool_calls:[call('{"date":"2026-08-20"}')]});}
   });
-  assert.equal(failed.status,503);
-  assert.equal(requests,2);
+  assert.equal(failed.status,200);
+  assert.equal(requests,3);
+  assert.match(await failed.text(),/执行失败/);
 });
 
 test('missing original ID and date-only misses stop without claiming history does not exist',async()=>{
@@ -198,7 +244,7 @@ test('missing original ID and date-only misses stop without claiming history doe
         ...(argumentsText.includes('original_message_id')?{lookup_status:'unavailable'}:{})}),
       fetchUpstream:async()=>{requests++;return completion({role:'assistant',tool_calls:[call(argumentsText)]});}
     });
-    assert.equal(requests,1);
+    assert.equal(requests,2);
     const output=await response.text();
     assert.match(output,/无法确认/);
     assert.match(output,/不代表历史记录不存在/);
@@ -394,9 +440,9 @@ test('retry identity injection and query failures remain errors, not normal miss
         requests++===0?{keyword:'拿铁咖啡'}:{keyword:'拿铁',...(['assistant_id','conversation_id'].includes(failure)?{[failure]:'other'}:{})}
       ))]})
     });
-    assert.equal(response.status,503);
+    assert.equal(response.status,failure==='database'?200:503);
     assert.equal(queries,['assistant_id','conversation_id'].includes(failure)?1:2);
-    assert.match(await response.text(),/History lookup unavailable/);
+    assert.match(await response.text(),failure==='database'?/执行失败/:/History lookup unavailable/);
   }
 });
 

@@ -21,7 +21,7 @@ const { authorizeArchiveRequest } = require("./archive/archive_auth");
 const { SseAssistantCollector } = require("./archive/archive_stream");
 const { registerArchiveRoutes } = require("./archive/archive_routes");
 const { registerHistoryRoutes } = require("./archive/history_query");
-const { eligibleForHistoryTool, completeWithHistoryTool } = require("./archive/history_tool");
+const { eligibleForHistoryTool, withHistoryAvailability, completeWithHistoryTool } = require("./archive/history_tool");
 const { RawChatArchiveService, buildChatCaptureInput } = require("./archive/archive_sync");
 const { validateArchiveIdentity } = require("./archive/archive_protocol");
 const {
@@ -989,7 +989,8 @@ app.post("/v1/chat/completions", async (req, reply) => {
         query: historyReader.query, fetchUpstream, log:historyLog
       })
       : await fetchUpstream((() => {
-        const upstreamBody = { ...body, messages: upstreamMessages };
+        const upstreamBody = { ...body, messages: readBooleanEnv("AYAN_HISTORY_TOOL_ENABLED", false)
+          ? withHistoryAvailability(upstreamMessages,false) : upstreamMessages };
         delete upstreamBody._kelivo_archive;
         return upstreamBody;
       })());

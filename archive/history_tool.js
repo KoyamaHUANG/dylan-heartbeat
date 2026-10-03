@@ -36,6 +36,19 @@ function eligibleForHistoryTool(body, binding, enabled) {
     !(body.tools || []).some(tool=>tool?.function?.name === HISTORY_TOOL_NAME);
 }
 
+function historyAvailabilityMessage(available) {
+  return {role:'system',content:available
+    ? 'Gateway request status: ayan_search_chat_history is registered and available in this request. Tool availability is request-scoped, not a cached capability. Do not deny this registration. A previous zero-hit lookup does not invalidate earlier successful lookups. Do not call a previous result fabricated without verified evidence. Only actual tool results support historical quotations.'
+    : 'Gateway request status: its internal ayan_search_chat_history is not available in this request because the required request identity, configuration, or client tool contract is not satisfied. Do not guess a conversation or bypass identity checks. This request-scoped restriction does not mean the tool never existed or that earlier tool results were fabricated. Explain the current limitation truthfully and do not invent historical quotations.'};
+}
+
+function withHistoryAvailability(messages, available) {
+  const result=[...messages];
+  const index=result.findLastIndex(message=>message.role==='user');
+  result.splice(index<0?result.length:index,0,historyAvailabilityMessage(available));
+  return result;
+}
+
 function toolArguments(raw, binding) {
   if (typeof raw !== 'string' || raw.length > 5000) throw new Error('invalid tool arguments');
   const value = JSON.parse(raw);
@@ -100,18 +113,46 @@ async function completeWithHistoryTool({body, messages, binding, query, fetchUps
   // Only fixed stage names and aggregate metadata: never arguments, text, IDs or errors.
   const emit = (stage, fields = {}) => { try { log({event:'ayan_history_tool',stage,...fields}); } catch {} };
   const unavailable = () => { emit('unavailable'); return unavailableResponse(); };
-  let workingMessages = [HISTORY_TRUST_RULE,...messages];
+  let workingMessages = [HISTORY_TRUST_RULE,...withHistoryAvailability(messages,true)];
   const seenQueries = new Set();
   const clientTools = body.tools || [];
   const clientToolNames = new Set(clientTools.map(tool=>tool?.function?.name));
   let historyUsed = false, safeEvidenceSeen = false;
   let keywordRetry = null;
   let keywordRetriesUsed = 0;
+  // Deliver terminal lookup status to the model, but keep the user-visible
+  // response grounded even if the continuing model invents content.
+  const finishLookup = async (message, completion, response, lookupStatus, content) => {
+    const toolResult={role:'tool',tool_call_id:message.tool_calls[0].id,content:JSON.stringify({
+      kind:'untrusted_history_search_result_v1',lookup_status:lookupStatus,
+      ...(lookupStatus==='not_found'?{total:0,messages:[],next_cursor:null}:{}),
+      ...(lookupStatus==='error'?{error:{code:'HISTORY_QUERY_FAILED',retryable:false}}:{}),
+      note:content
+    })};
+    emit('tool_result_queued',{lookup_status:lookupStatus,returned:0});
+    const request={...body,messages:[...workingMessages,message,toolResult],
+      tools:[...clientTools,HISTORY_TOOL],tool_choice:'none',stream:false};
+    delete request._kelivo_archive;
+    emit('upstream_request',{history_used:true,terminal_status:lookupStatus,history_tool_registered:true});
+    try {
+      const next=await fetchUpstream(request);
+      if(!next.ok){emit('upstream_failed',{status:next.status});return unavailable();}
+      const payload=JSON.parse(await next.text());
+      if(payload?.choices?.[0]?.message?.role!=='assistant')return unavailable();
+      const calls=payload.choices[0].message.tool_calls;
+      emit('model_response',{tool_call_count:Array.isArray(calls)?calls.length:0,
+        history_call_count:Array.isArray(calls)?calls.filter(call=>call?.function?.name===HISTORY_TOOL_NAME).length:0,
+        terminal_status:lookupStatus});
+      emit('final_answer',{history_used:true,safe_evidence_seen:false,lookup_status:lookupStatus});
+      return safeAnswer(payload,next,body.stream===true,content);
+    } catch {emit('upstream_failed');return unavailable();}
+  };
   for (let count = 0; count <= MAX_HISTORY_TOOL_CALLS; count++) {
     const request = {...body, messages:workingMessages, tools:[...clientTools,HISTORY_TOOL],
       tool_choice:historyUsed?'auto':(body.tool_choice == null?'auto':body.tool_choice), stream:false};
     delete request._kelivo_archive;
-    emit('upstream_request', {round:count,history_used:historyUsed});
+    emit('upstream_request', {round:count,history_used:historyUsed,history_tool_registered:true,
+      message_count:workingMessages.length,request_bytes:Buffer.byteLength(JSON.stringify(request))});
     let response;
     try { response = await fetchUpstream(request); }
     catch (error) { emit('upstream_failed', {round:count}); throw error; }
@@ -132,6 +173,10 @@ async function completeWithHistoryTool({body, messages, binding, query, fetchUps
         return safeAnswer(completion,response,body.stream === true,HISTORY_NOT_FOUND);
       if (historyUsed && !safeEvidenceSeen)
         return safeAnswer(completion,response,body.stream === true,'查到的历史记录没有可安全用于回答的正文，无法确认。');
+      if (typeof message.content==='string' && /(?:我.{0,12}(?:没有|无法使用|不能调用).{0,20}(?:ayan_search_chat_history|历史.{0,6}工具)|I (?:do not|don't) have.{0,30}ayan_search_chat_history|(?:之前|此前|刚才).{0,20}(?:检索|历史|记录).{0,20}(?:是我编造|是编造|是捏造))/i.test(message.content)) {
+        emit('unsupported_tool_denial');
+        return safeAnswer(completion,response,body.stream===true,'本次请求已提供 Gateway 历史搜索工具；不能在没有可靠证据时否认此前的检索。具体历史内容须以工具实际返回为准。');
+      }
       return completionResponse(completion, response, body.stream === true);
     }
     const historyCalls = calls.filter(call=>call.function.name === HISTORY_TOOL_NAME);
@@ -172,7 +217,7 @@ async function completeWithHistoryTool({body, messages, binding, query, fetchUps
         has_range:argumentsValue.start != null,has_keyword:argumentsValue.keyword != null,
         has_original_id:argumentsValue.original_message_id != null,has_cursor:argumentsValue.cursor != null});
       try { result = await query(argumentsValue); }
-      catch { emit('query_failed', {round:count}); return unavailable(); }
+      catch { emit('query_failed', {round:count}); return finishLookup(message,completion,response,'error','历史检索执行失败，无法核验本次历史；这不是零命中，也不代表历史不存在或此前检索是编造的。'); }
     } catch { emit('arguments_rejected', {round:count}); return unavailable(); }
     historyUsed = true;
     if (!result || !Array.isArray(result.messages) || !Number.isSafeInteger(result.total) || result.total < 0 ||
@@ -185,9 +230,9 @@ async function completeWithHistoryTool({body, messages, binding, query, fetchUps
       has_next_cursor:Boolean(result.next_cursor)});
     if (result.total === 0 || result.messages.length === 0) {
       if (argumentsValue.original_message_id)
-        return safeAnswer(completion,response,body.stream === true,'本次检索未找到该原始消息 ID 的可用历史记录，无法确认；这不代表历史记录不存在。');
+        return finishLookup(message,completion,response,'unavailable','本次检索未找到该原始消息 ID 的可用历史记录，无法确认；这不代表历史记录不存在。');
       if (!argumentsValue.keyword || argumentsValue.cursor != null || result.total !== 0)
-        return safeAnswer(completion,response,body.stream === true,HISTORY_NOT_FOUND);
+        return finishLookup(message,completion,response,result.total===0?'not_found':'unavailable',HISTORY_NOT_FOUND);
       if (!keywordRetry) {
         keywordRetry = {scope:{},keywords:new Set([argumentsValue.keyword.trim().toLowerCase()]),remaining:MAX_KEYWORD_RETRIES-keywordRetriesUsed};
         for (const key of ['date','start','end'])
@@ -218,4 +263,4 @@ async function completeWithHistoryTool({body, messages, binding, query, fetchUps
   return unavailable();
 }
 
-module.exports = {HISTORY_TOOL,HISTORY_TOOL_NAME,eligibleForHistoryTool,toolArguments,historyRecord,completeWithHistoryTool};
+module.exports = {HISTORY_TOOL,HISTORY_TOOL_NAME,eligibleForHistoryTool,withHistoryAvailability,toolArguments,historyRecord,completeWithHistoryTool};

@@ -20,6 +20,26 @@ const {app,historyReader,rawChatArchive} = require('../server');
 rawChatArchive.enabled = false;
 const originalFetch = global.fetch;
 
+test('missing identity explains request-scoped unavailability without injecting or querying history',async()=>{
+  let requests=0;
+  historyReader.query=async()=>assert.fail('unbound request must not query history');
+  global.fetch=async(url,options)=>{
+    requests++;
+    const request=JSON.parse(options.body);
+    assert.equal(request.tools,undefined);
+    assert.match(request.messages.at(-2).content,/not available in this request/);
+    assert.match(request.messages.at(-2).content,/does not mean the tool never existed/);
+    assert.equal(request.messages.at(-1).role,'user');
+    return new Response(JSON.stringify({choices:[{message:{role:'assistant',content:'本次缺少有效身份。'}}]}),
+      {headers:{'content-type':'application/json'}});
+  };
+  const result=await app.inject({method:'POST',url:'/v1/chat/completions',remoteAddress:'10.0.0.8',
+    headers:{authorization:'Bearer mock-gateway-key'},
+    payload:{model:'mock-model',stream:false,messages:[{role:'user',content:'为什么你没有历史工具？'}]}});
+  assert.equal(result.statusCode,200);
+  assert.equal(requests,1);
+});
+
 test.after(async()=>{
   global.fetch = originalFetch;
   await app.close();
