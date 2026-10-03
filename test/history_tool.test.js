@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  HISTORY_TOOL_NAME, eligibleForHistoryTool, toolArguments, historyRecord, completeWithHistoryTool
+  HISTORY_TOOL, HISTORY_TOOL_NAME, eligibleForHistoryTool, toolArguments, historyRecord, completeWithHistoryTool
 } = require('../archive/history_tool');
 
 const binding = {provided:true,assistant_id:'ayan',conversation_id:'conversation-A'};
@@ -10,6 +10,43 @@ const completion = message => new Response(JSON.stringify({
   id:'mock-1',model:'mock-model',choices:[{index:0,message,finish_reason:message.tool_calls?'tool_calls':'stop'}]
 }), {status:200,headers:{'content-type':'application/json'}});
 const call = argumentsText => ({id:'call-history-1',type:'function',function:{name:HISTORY_TOOL_NAME,arguments:argumentsText}});
+
+test('history declaration and system guidance identify the directly available archive tool',async()=>{
+  assert.match(HISTORY_TOOL.function.description,/Gateway internal read-only/);
+  assert.match(HISTORY_TOOL.function.description,/imported Kelivo history/);
+  await completeWithHistoryTool({body,messages:body.messages,binding,
+    query:async()=>assert.fail('no query expected'),
+    fetchUpstream:async request=>{
+      assert.match(request.messages[0].content,/use ayan_search_chat_history/);
+      assert.match(request.messages[0].content,/not an Ombre MCP tool/);
+      assert.match(request.messages[0].content,/Do not claim you searched/);
+      return completion({role:'assistant',content:'请提供日期。'});
+    }});
+});
+
+test('stage logs correlate query and continuation without leaking search content or identity',async()=>{
+  const events=[];
+  let requests=0;
+  await completeWithHistoryTool({body,messages:body.messages,binding,log:event=>events.push(event),
+    query:async()=>({total:1,next_cursor:null,messages:[{id:'secret-record',content_text:'private-text',role:'user'}]}),
+    fetchUpstream:async()=>++requests===1
+      ?completion({role:'assistant',tool_calls:[call('{"keyword":"private-keyword"}')]})
+      :completion({role:'assistant',content:'private-answer'})});
+  assert.deepEqual(events.map(event=>event.stage),['upstream_request','model_response','query_started',
+    'query_completed','tool_result_queued','upstream_request','model_response','final_answer']);
+  assert.equal(events.find(event=>event.stage==='query_completed').total,1);
+  assert.doesNotMatch(JSON.stringify(events),/private-|secret-record|conversation-A|ayan"/);
+});
+
+test('query failure is distinguishable from a model response with no history call',async()=>{
+  const events=[];
+  const response=await completeWithHistoryTool({body,messages:body.messages,binding,log:event=>events.push(event),
+    query:async()=>{throw new Error('private database details');},
+    fetchUpstream:async()=>completion({role:'assistant',tool_calls:[call('{"keyword":"private-keyword"}')]})});
+  assert.equal(response.status,503);
+  assert.deepEqual(events.slice(-2).map(event=>event.stage),['query_failed','unavailable']);
+  assert.doesNotMatch(JSON.stringify(events),/private/);
+});
 
 test('history tool is opt-in and preserves existing client tool contracts',()=>{
   assert.equal(eligibleForHistoryTool(body,binding,true),true);

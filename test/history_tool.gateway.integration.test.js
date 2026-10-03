@@ -28,6 +28,10 @@ test.after(async()=>{
 
 test('Gateway keeps a Kelivo tool while archiving one ordinary turn around a bound history lookup',async t=>{
   const requests=[],queries=[];
+  const logs=[];
+  t.mock.method(console,'log',line=>{
+    if (typeof line === 'string' && line.startsWith('{')) logs.push(JSON.parse(line));
+  });
   const captures=[];
   t.mock.method(rawChatArchive,'captureChatRequest',input=>{
     const capture={input,assistants:[]};
@@ -85,6 +89,13 @@ test('Gateway keeps a Kelivo tool while archiving one ordinary turn around a bou
   assert.equal(captures[0].input.client_user_message_id,'message-mock-1');
   assert.equal(captures[0].assistants.length,1);
   assert.match(captures[0].assistants[0].content,/我查到一条模拟历史消息/);
+  const historyLogs=logs.filter(entry=>entry.event==='ayan_history_tool');
+  assert.deepEqual(historyLogs.map(entry=>entry.stage),['eligibility','upstream_request','model_response',
+    'query_started','query_completed','tool_result_queued','upstream_request','model_response','final_answer']);
+  assert.equal(historyLogs[0].eligible,true);
+  assert.equal(new Set(historyLogs.map(entry=>entry.request_id)).size,1);
+  assert.equal(typeof historyLogs[0].request_id,'string');
+  assert.doesNotMatch(JSON.stringify(historyLogs),/conversation-A|模拟历史消息|original-mock-1|call-history/);
 });
 
 test('Gateway passes an existing Kelivo tool call back to the client without a history lookup',async()=>{

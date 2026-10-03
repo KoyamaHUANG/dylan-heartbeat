@@ -973,10 +973,20 @@ app.post("/v1/chat/completions", async (req, reply) => {
     const historyToolEnabled = readBooleanEnv("AYAN_HISTORY_TOOL_ENABLED", false) &&
       readBooleanEnv("ARCHIVE_ENABLED", false) && Boolean(process.env.ARCHIVE_DATABASE_URL && process.env.ARCHIVE_API_KEY) &&
       archiveProtocol.valid && archiveProtocol.identity?.kind === "user_send";
-    const response = eligibleForHistoryTool(body, kelivoSyncBinding, historyToolEnabled)
+    const historyToolEligible = eligibleForHistoryTool(body, kelivoSyncBinding, historyToolEnabled);
+    const historyLog = entry => console.log(JSON.stringify({...entry,request_id:req.id}));
+    historyLog({event:"ayan_history_tool",stage:"eligibility",eligible:historyToolEligible,
+      configured_enabled:readBooleanEnv("AYAN_HISTORY_TOOL_ENABLED", false),
+      archive_enabled:readBooleanEnv("ARCHIVE_ENABLED", false),
+      archive_configured:Boolean(process.env.ARCHIVE_DATABASE_URL && process.env.ARCHIVE_API_KEY),
+      protocol_valid:archiveProtocol.valid === true,
+      user_send:archiveProtocol.identity?.kind === "user_send",binding_provided:kelivoSyncBinding?.provided === true,
+      tool_choice_none:body.tool_choice === "none",
+      name_collision:Array.isArray(body.tools) && body.tools.some(tool=>tool?.function?.name === "ayan_search_chat_history")});
+    const response = historyToolEligible
       ? await completeWithHistoryTool({
         body, messages: upstreamMessages, binding: kelivoSyncBinding,
-        query: historyReader.query, fetchUpstream
+        query: historyReader.query, fetchUpstream, log:historyLog
       })
       : await fetchUpstream((() => {
         const upstreamBody = { ...body, messages: upstreamMessages };
