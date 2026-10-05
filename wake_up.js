@@ -8,6 +8,7 @@ const { parseChatCompletionResponse } = require("./upstream_response");
 const { validateProactiveBody } = require("./proactive_safety");
 const { appendProactiveProvenance, sha256, updateProactiveProvenance } = require("./proactive_provenance");
 const { getConversationStatePaths, loadKelivoSyncContexts } = require("./kelivo_sync_context");
+const { resolveProactiveTargets } = require("./proactive_target_routes");
 const {
   formatDateTimeInTimeZone,
   getDatePartsInTimeZone,
@@ -699,7 +700,23 @@ async function runWakeUpForTarget(target) {
 }
 
 async function runWakeUp() {
-  const targets = loadKelivoSyncContexts();
+  let targets;
+  try {
+    const selection = resolveProactiveTargets(loadKelivoSyncContexts());
+    targets = selection.targets;
+    if (selection.configured) {
+      console.log(JSON.stringify({
+        event: "proactive_target_routes_selected",
+        route_file_created: selection.created,
+        target_count: targets.length,
+        routes: selection.route_status
+      }));
+    }
+  } catch (error) {
+    console.warn(JSON.stringify({ event: "wake_skipped", reason: "proactive_target_routes_unavailable",
+      error_category: error?.code || "storage_error" }));
+    return [];
+  }
   if (targets.length === 0) {
     console.log(JSON.stringify({ event: "wake_skipped", reason: "no_bound_conversation_targets" }));
     return [];

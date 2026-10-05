@@ -64,6 +64,56 @@ test.after(() => {
   fs.rmSync(dataDirectory, { recursive: true, force: true });
 });
 
+test("target route stops old wake generation and sends only from restored conversation state", async () => {
+  writeWakeState("old conversation marker");
+  const restoredTarget = { conversation_id: "restored-integration", assistant_id: "restored-ayan" };
+  const state = getConversationStatePaths(restoredTarget);
+  const registryFile = path.join(dataDirectory, "kelivo_sync_context_v2.json");
+  const registryBefore = fs.readFileSync(registryFile);
+  const routeFile = path.join(dataDirectory, "proactive_target_routes.json");
+  const routeEnvBefore = process.env.PROACTIVE_TARGET_ROUTES_JSON;
+  const originalFetch = global.fetch;
+  const requests = [];
+  try {
+    const user = { role: "user", content: "restored conversation marker" };
+    fs.mkdirSync(state.directory, { recursive: true });
+    fs.writeFileSync(state.timeline_file, JSON.stringify([{ role: "system", content: "restored system" }, user]));
+    fs.writeFileSync(state.timestamp_db_file, JSON.stringify({
+      [makeFingerprint(user)]: new Date(Date.now() - 5 * 60 * 1000).toISOString()
+    }));
+    saveKelivoSyncContext({ ...restoredTarget, latest_user_fingerprint: makeFingerprint(user) });
+    const registryBound = fs.readFileSync(registryFile);
+    const oldTimeline = fs.readFileSync(getConversationStatePaths(wakeTarget).timeline_file);
+    process.env.PROACTIVE_TARGET_ROUTES_JSON = JSON.stringify({ version: 1,
+      routes: [{ name: "primary", retired_bindings: [wakeTarget], target: restoredTarget }] });
+    global.fetch = async (url, options = {}) => {
+      requests.push({ url: String(url), options });
+      if (url === requestyUrl) return jsonResponse(200, {
+        choices: [{ message: { content: structured("send", "restored proactive body") } }]
+      });
+      if (url === "https://api.day.app/push") return jsonResponse(200, { code: 200 });
+      if (url === `${gatewayBaseUrl}/internal/wake-event`) return jsonResponse(200, { success: true });
+      throw new Error(`unexpected URL: ${url}`);
+    };
+    await runWakeUp();
+    const modelCalls = requests.filter(request => request.url === requestyUrl);
+    assert.equal(modelCalls.length, 1);
+    assert.match(modelCalls[0].options.body, /restored conversation marker/);
+    assert.doesNotMatch(modelCalls[0].options.body, /old conversation marker/);
+    const eventCalls = requests.filter(request => request.url === `${gatewayBaseUrl}/internal/wake-event`);
+    assert.equal(eventCalls.length, 1);
+    assert.deepEqual(JSON.parse(eventCalls[0].options.body).binding, restoredTarget);
+    assert.deepEqual(fs.readFileSync(registryFile), registryBound);
+    assert.deepEqual(fs.readFileSync(getConversationStatePaths(wakeTarget).timeline_file), oldTimeline);
+  } finally {
+    global.fetch = originalFetch;
+    if (routeEnvBefore === undefined) delete process.env.PROACTIVE_TARGET_ROUTES_JSON;
+    else process.env.PROACTIVE_TARGET_ROUTES_JSON = routeEnvBefore;
+    if (fs.existsSync(routeFile)) fs.unlinkSync(routeFile);
+    fs.writeFileSync(registryFile, registryBefore);
+  }
+});
+
 test("wake-up 使用最小 Requesty Chat Completions payload 并发送 Bark", async () => {
   writeWakeState();
   const originalFetch = global.fetch;
